@@ -16,9 +16,12 @@ This document states baseline requirements and decisions.
   auth defaults.
 - SQLite is acceptable when one `workd` owns the DB. Postgres remains available
   for deployments that need it. Never share a SQLite file across machines.
-- The first implementation stores daemon-owned state as JSON task records under a
-  local state directory. This is an implementation scaffold for the local
-  vertical slice; replacing it with SQLite should not change CLI semantics.
+- The first implementation stores daemon-owned state in SQLite under the local
+  state directory. One `workd` owns this database; task workspaces and large
+  artifacts remain filesystem-backed.
+- Persistence is accessed through a `ControlStore` trait. SQLite is the first
+  implementation, but the daemon should not depend on SQLite-specific APIs so a
+  Postgres-backed store can replace it for multi-worker/server deployments.
 
 ## Dynamic config
 
@@ -38,6 +41,16 @@ This document states baseline requirements and decisions.
 - External issue/review state is observed or snapshotted; it must not silently
   replace task intent.
 - A task may produce many outputs across mounted repos.
+- Task outputs must be durable control-plane records with enough body/metadata to
+  publish them to external collaboration surfaces without rereading transient
+  workspace files.
+- External publication is a projection of stored inputs/outputs/artifacts. Linear
+  comments, Slack threads, GitHub reviews, manual handoffs, or other targets are
+  tracked by append-only task records such as projection requested/succeeded/
+  failed, integration observed, and acknowledged.
+- Current publication state should be rebuildable from records. Materialized
+  delivery tables/views are allowed later for query speed but must not become the
+  only source of truth.
 
 ## Context preparation
 
@@ -79,3 +92,5 @@ This document states baseline requirements and decisions.
   policy gates pass.
 - Active leases, protected resources, stale observations, or ambiguous state block
   automatic cleanup and may create attention.
+- Cleanup must not remove the only copy of an output whose required projection or
+  acknowledgement records have not been observed according to policy.

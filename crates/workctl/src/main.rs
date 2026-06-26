@@ -35,6 +35,9 @@ enum TaskCommand {
     Submit(SubmitArgs),
     Get { task_id: String },
     List,
+    Outputs { task_id: String },
+    Records { task_id: String },
+    Artifacts { task_id: String },
 }
 
 #[derive(Debug, Parser)]
@@ -125,6 +128,42 @@ async fn main() -> Result<()> {
             } else {
                 for task in tasks {
                     println!("{}\t{}\t{}", task.id, task.state, task.title);
+                }
+            }
+        }
+        Command::Task {
+            command: TaskCommand::Outputs { task_id },
+        } => {
+            let task = client.get(&task_id).await?;
+            if cli.json {
+                print_value(true, &task.outputs)?;
+            } else {
+                for output in task.outputs {
+                    println!("{}\t{:?}\t{}", output.id, output.kind, output.title);
+                }
+            }
+        }
+        Command::Task {
+            command: TaskCommand::Records { task_id },
+        } => {
+            let task = client.get(&task_id).await?;
+            if cli.json {
+                print_value(true, &task.records)?;
+            } else {
+                for record in task.records {
+                    println!("{}\t{:?}\t{:?}", record.id, record.kind, record.subject);
+                }
+            }
+        }
+        Command::Task {
+            command: TaskCommand::Artifacts { task_id },
+        } => {
+            let task = client.get(&task_id).await?;
+            if cli.json {
+                print_value(true, &task.artifacts)?;
+            } else {
+                for artifact in task.artifacts {
+                    println!("{}\t{}", artifact.kind, artifact.path);
                 }
             }
         }

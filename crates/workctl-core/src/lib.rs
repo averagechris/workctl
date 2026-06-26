@@ -48,6 +48,52 @@ pub struct ExecutionContextId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactId(pub String);
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OutputId(pub String);
+
+impl OutputId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(format!("out_{}", Uuid::new_v4().simple()))
+    }
+}
+
+impl Default for OutputId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Display for OutputId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RecordId(pub String);
+
+impl RecordId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(format!("rec_{}", Uuid::new_v4().simple()))
+    }
+}
+
+impl Default for RecordId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Display for RecordId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoSpec {
     pub url: String,
@@ -151,6 +197,55 @@ pub struct Artifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskOutput {
+    pub id: OutputId,
+    pub kind: OutputKind,
+    pub title: String,
+    pub body: String,
+    pub source_artifacts: Vec<String>,
+    pub created_at_ms: u128,
+    pub updated_at_ms: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutputKind {
+    Summary,
+    Log,
+    Handoff,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRecord {
+    pub id: RecordId,
+    pub kind: TaskRecordKind,
+    pub subject: RecordSubject,
+    pub body: serde_json::Value,
+    pub created_at_ms: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRecordKind {
+    InputReceived,
+    OutputCreated,
+    ArtifactCreated,
+    ProjectionRequested,
+    ProjectionSucceeded,
+    ProjectionFailed,
+    IntegrationObserved,
+    Acknowledged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "kebab-case")]
+pub enum RecordSubject {
+    Task,
+    Output(OutputId),
+    Artifact(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
     pub organization_id: OrganizationId,
@@ -159,8 +254,15 @@ pub struct Task {
     pub intent: String,
     pub spec: TaskSpec,
     pub workspace_path: Option<String>,
+    #[serde(default)]
     pub summary: Option<String>,
+    #[serde(default)]
     pub artifacts: Vec<Artifact>,
+    #[serde(default)]
+    pub outputs: Vec<TaskOutput>,
+    #[serde(default)]
+    pub records: Vec<TaskRecord>,
+    #[serde(default)]
     pub last_error: Option<String>,
     pub created_at_ms: u128,
     pub updated_at_ms: u128,
@@ -247,5 +349,27 @@ mod tests {
     #[test]
     fn ids_are_prefixed() {
         assert!(TaskId::new().0.starts_with("task_"));
+        assert!(OutputId::new().0.starts_with("out_"));
+        assert!(RecordId::new().0.starts_with("rec_"));
+    }
+
+    #[test]
+    fn task_record_serializes_projection_events() {
+        let record = TaskRecord {
+            id: RecordId("rec_test".into()),
+            kind: TaskRecordKind::ProjectionRequested,
+            subject: RecordSubject::Output(OutputId("out_test".into())),
+            body: serde_json::json!({
+                "integration": "linear",
+                "target": {"issue_id": "ABC-123", "surface": "comment"},
+                "idempotency_key": "task/out/linear/ABC-123/comment"
+            }),
+            created_at_ms: 1,
+        };
+
+        let json = serde_json::to_value(record).unwrap();
+        assert_eq!(json["kind"], "projection_requested");
+        assert_eq!(json["subject"]["kind"], "output");
+        assert_eq!(json["body"]["integration"], "linear");
     }
 }

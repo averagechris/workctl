@@ -95,14 +95,23 @@ The first implementation pass provides a local-only end-to-end path:
    ```
 
 `workd` owns state under `${XDG_DATA_HOME:-~/.local/share}/workctl` by default.
-Each task gets a local workspace with cloned repos, a generated prompt, artifacts,
-and redirected `HOME` / XDG / temp paths for process-level isolation. The
-OpenCode harness symlinks host OpenCode config/data into those redirected XDG
-paths when present so local credentials can be used without copying secret files
-into the workspace. If the primary repo has a `flake.nix`, the OpenCode ACP
-harness is started through
+Canonical state is stored in `workd.sqlite3` with normalized tasks, outputs,
+records, and artifacts; per-task workspaces hold cloned repos, generated prompts,
+and large artifacts. Each task gets redirected `HOME` / XDG / temp paths for
+process-level isolation. The OpenCode harness symlinks host OpenCode config/data
+into those redirected XDG paths when present so local credentials can be used
+without copying secret files into the workspace. If the primary repo has a
+`flake.nix`, the OpenCode ACP harness is started through
 `nix develop <repo> --command opencode acp --cwd <repo>`; otherwise it is started
 directly.
+
+Inspect task outputs, records, and artifacts with:
+
+```sh
+workctl task outputs <task-id>
+workctl task records <task-id>
+workctl task artifacts <task-id>
+```
 
 The default test path uses `--harness fake-summary` so CI does not need network,
 SSH, or LLM credentials. The real Sourcehut/OpenCode E2E is ignored by default

@@ -62,6 +62,19 @@ fn cli_submits_task_to_workd_loop_with_fake_harness() {
     let task: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(task["state"], "done");
     assert!(task["summary"].as_str().unwrap().contains("README.md"));
+    assert_eq!(task["outputs"][0]["kind"], "summary");
+    assert!(
+        task["outputs"][0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("README.md")
+    );
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "input_received" && record["subject"]["kind"] == "task"
+    }));
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "output_created" && record["subject"]["kind"] == "output"
+    }));
     let workspace = task["workspace_path"].as_str().unwrap();
     assert!(Path::new(workspace).join("repos/fixture/.git").exists());
     assert!(
@@ -127,6 +140,16 @@ fn e2e_opencode_summarizes_linear_cli() {
     assert_eq!(task["state"], "done");
     let summary = task["summary"].as_str().unwrap();
     assert!(summary.to_lowercase().contains("linear"));
+    assert_eq!(task["outputs"][0]["kind"], "summary");
+    assert!(
+        task["outputs"][0]["body"]
+            .as_str()
+            .unwrap()
+            .contains(summary)
+    );
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "output_created" && record["subject"]["kind"] == "output"
+    }));
     let workspace = task["workspace_path"].as_str().unwrap();
     assert!(Path::new(workspace).join("repos/linear-cli/.git").exists());
     assert!(

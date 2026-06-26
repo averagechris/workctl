@@ -87,6 +87,17 @@ Review or integration result produced by a task: local change, direct commit, PR
 patch email, review summary, release note, migration plan, etc. A task may have
 many outputs across many mounted repos.
 
+Outputs are stored as durable control-plane records, not just files on disk,
+because the same output may need to be projected to external surfaces such as
+Linear comments, Slack threads, GitHub reviews, or manual handoff notes.
+
+Publication state is modeled as a replayable task record stream, not as nested
+state on the output itself. Integrations append projection-requested,
+projection-succeeded, projection-failed, integration-observed, and acknowledged
+records. Current views such as “has this summary been posted to Linear?” or
+“which Slack thread still needs attention?” should be derived from the input,
+output, artifact, and task-record history so they can be rehydrated from scratch.
+
 ### Lease
 
 Explicit ownership for tasks, contexts, sessions, runtime resources, and actions.
@@ -156,15 +167,20 @@ complete distributed control plane:
 ```text
 workctl submit
   -> HTTP request to local workd
-  -> JSON task record under the daemon state dir
+  -> SQLite task/output/record rows under the daemon state dir
   -> embedded workd worker loop claims created task
   -> local-devshell context preparation clones repos and writes prompt/manifest
   -> fake-summary or opencode-acp harness runs in the prepared context
-  -> summary and protocol/context artifacts are written back to the task
+  -> summary output, output-created record, and protocol/context artifacts are written back to the task
 ```
 
 This preserves the architectural seams from the north-star docs while keeping the
-first pass inspectable. The JSON file store, single-node HTTP transport, and
-embedded worker are not the final deployment model; the durable semantics that
-should survive replacement are task submission through `workd`, explicit context
-preparation, executor/harness separation, and artifact-backed outputs.
+first pass inspectable. The single-node HTTP transport and embedded worker are
+not the final deployment model; the durable semantics that should survive
+replacement are task submission through `workd`, explicit context preparation,
+executor/harness separation, durable outputs, replayable task records, and
+artifact-backed large data.
+
+`workd` accesses persistence through a `ControlStore` trait. The local
+implementation is SQLite-backed, while worker claims remain an in-memory
+single-daemon mechanism until leases/actions become durable store records.

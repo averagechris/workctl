@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, State},
@@ -7,6 +8,7 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -27,7 +29,8 @@ use tokio::{
 use tracing::{error, info, warn};
 use workctl_core::{
     Artifact, ContextManifest, DevshellManifest, DevshellMode, HarnessKind, HealthResponse,
-    OrganizationId, PreparedRepo, RepoSpec, SubmitTaskRequest, SubmitTaskResponse, Task, TaskId,
+    OrganizationId, OutputId, OutputKind, PreparedRepo, RecordId, RecordSubject, RepoSpec,
+    SubmitTaskRequest, SubmitTaskResponse, Task, TaskId, TaskOutput, TaskRecord, TaskRecordKind,
     TaskSpec, TaskState, product_sentence,
 };
 
@@ -61,8 +64,11 @@ struct ServeArgs {
 
 #[derive(Clone)]
 struct AppState {
-    store: Store,
+    store: Arc<dyn ControlStore>,
+    claims: Claims,
 }
+
+type Claims = Arc<Mutex<HashMap<TaskId, ()>>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -80,8 +86,11 @@ async fn main() -> Result<()> {
 async fn serve(args: ServeArgs) -> Result<()> {
     let state_dir = args.state_dir.unwrap_or_else(default_state_dir);
     fs::create_dir_all(&state_dir).await?;
-    let store = Store::new(state_dir).await?;
-    let state = AppState { store };
+    let store: Arc<dyn ControlStore> = Arc::new(SqliteStore::new(state_dir).await?);
+    let state = AppState {
+        store,
+        claims: Arc::new(Mutex::new(HashMap::new())),
+    };
 
     if !args.disable_worker {
         let worker_state = state.clone();
@@ -124,12 +133,14 @@ async fn submit_task(
     }
 
     let now = now_ms();
+    let title = request.title;
+    let intent = request.intent;
     let task = Task {
         id: TaskId::new(),
         organization_id: OrganizationId("local".into()),
         state: TaskState::Created,
-        title: request.title,
-        intent: request.intent,
+        title: title.clone(),
+        intent: intent.clone(),
         spec: TaskSpec {
             repos: request.repos,
             harness: request.harness,
@@ -138,6 +149,14 @@ async fn submit_task(
         workspace_path: None,
         summary: None,
         artifacts: Vec::new(),
+        outputs: Vec::new(),
+        records: vec![TaskRecord {
+            id: RecordId::new(),
+            kind: TaskRecordKind::InputReceived,
+            subject: RecordSubject::Task,
+            body: json!({"title": title, "intent": intent}),
+            created_at_ms: now,
+        }],
         last_error: None,
         created_at_ms: now,
         updated_at_ms: now,
@@ -167,27 +186,27 @@ async fn list_tasks(State(state): State<AppState>) -> Result<Json<Vec<Task>>, Ap
 
 async fn worker_loop(state: AppState, interval: Duration) {
     loop {
-        if let Err(err) = worker_tick(&state.store).await {
+        if let Err(err) = worker_tick(state.store.as_ref(), &state.claims).await {
             error!(?err, "worker tick failed");
         }
         tokio::time::sleep(interval).await;
     }
 }
 
-async fn worker_tick(store: &Store) -> Result<()> {
+async fn worker_tick(store: &dyn ControlStore, claims: &Claims) -> Result<()> {
     let tasks = store.list().await?;
     for task in tasks {
-        if task.state == TaskState::Created && store.try_claim(&task.id).await? {
+        if task.state == TaskState::Created && try_claim(claims, &task.id).await {
             let task_id = task.id.clone();
             process_task(store, task).await;
-            store.release_claim(&task_id).await;
+            release_claim(claims, &task_id).await;
             return Ok(());
         }
     }
     Ok(())
 }
 
-async fn process_task(store: &Store, mut task: Task) {
+async fn process_task(store: &dyn ControlStore, mut task: Task) {
     let result = async {
         mark(store, &mut task, TaskState::ContextRequested).await?;
         let prepared = prepare_context(store, &mut task).await?;
@@ -196,13 +215,36 @@ async fn process_task(store: &Store, mut task: Task) {
         let summary = run_harness(&task, &prepared).await?;
         let summary_path = prepared.artifact_dir.join("summary.md");
         fs::write(&summary_path, &summary).await?;
-        task.summary = Some(summary);
+        task.summary = Some(summary.clone());
+        let summary_artifact_path = summary_path.display().to_string();
         task.artifacts.push(Artifact {
             kind: "summary".into(),
-            path: summary_path.display().to_string(),
+            path: summary_artifact_path.clone(),
         });
+        let now = now_ms();
+        let output = TaskOutput {
+            id: OutputId::new(),
+            kind: OutputKind::Summary,
+            title: format!("Summary for {}", task.title),
+            body: summary,
+            source_artifacts: vec![summary_artifact_path],
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        task.records.push(TaskRecord {
+            id: RecordId::new(),
+            kind: TaskRecordKind::OutputCreated,
+            subject: RecordSubject::Output(output.id.clone()),
+            body: json!({
+                "kind": output.kind,
+                "title": output.title,
+                "source_artifacts": output.source_artifacts,
+            }),
+            created_at_ms: now,
+        });
+        task.outputs.push(output);
         task.state = TaskState::Done;
-        task.updated_at_ms = now_ms();
+        task.updated_at_ms = now;
         store.save(&task).await?;
         Result::<()>::Ok(())
     }
@@ -219,7 +261,7 @@ async fn process_task(store: &Store, mut task: Task) {
     }
 }
 
-async fn mark(store: &Store, task: &mut Task, state: TaskState) -> Result<()> {
+async fn mark(store: &dyn ControlStore, task: &mut Task, state: TaskState) -> Result<()> {
     task.state = state;
     task.updated_at_ms = now_ms();
     store.save(task).await
@@ -232,7 +274,7 @@ struct PreparedContext {
     manifest: ContextManifest,
 }
 
-async fn prepare_context(store: &Store, task: &mut Task) -> Result<PreparedContext> {
+async fn prepare_context(store: &dyn ControlStore, task: &mut Task) -> Result<PreparedContext> {
     let workspace = store.workspace_root().join(task.id.to_string());
     let repos_dir = workspace.join("repos");
     let artifact_dir = workspace.join("artifacts");
@@ -687,73 +729,326 @@ async fn log_line(log: &mut fs::File, direction: &str, line: &str) -> Result<()>
     Ok(())
 }
 
-#[derive(Clone)]
-struct Store {
-    root: PathBuf,
-    claims: Arc<Mutex<HashMap<TaskId, ()>>>,
+#[async_trait]
+trait ControlStore: Send + Sync {
+    fn workspace_root(&self) -> PathBuf;
+    async fn save(&self, task: &Task) -> Result<()>;
+    async fn load(&self, id: &TaskId) -> Result<Option<Task>>;
+    async fn list(&self) -> Result<Vec<Task>>;
 }
 
-impl Store {
+#[derive(Clone)]
+struct SqliteStore {
+    root: PathBuf,
+    db: Arc<Mutex<Connection>>,
+}
+
+impl SqliteStore {
     async fn new(root: PathBuf) -> Result<Self> {
-        fs::create_dir_all(root.join("tasks")).await?;
         fs::create_dir_all(root.join("workspaces")).await?;
+        let db_path = root.join("workd.sqlite3");
+        let connection = Connection::open(db_path)?;
+        migrate(&connection)?;
         Ok(Self {
             root,
-            claims: Arc::new(Mutex::new(HashMap::new())),
+            db: Arc::new(Mutex::new(connection)),
         })
     }
+}
 
+#[async_trait]
+impl ControlStore for SqliteStore {
     fn workspace_root(&self) -> PathBuf {
         self.root.join("workspaces")
     }
 
     async fn save(&self, task: &Task) -> Result<()> {
-        let path = self.task_path(&task.id);
-        let temp = path.with_extension("json.tmp");
-        fs::write(&temp, serde_json::to_vec_pretty(task)?).await?;
-        fs::rename(temp, path).await?;
+        let mut db = self.db.lock().await;
+        let tx = db.transaction()?;
+        tx.execute(
+            "INSERT INTO tasks (
+                id, organization_id, state, title, intent, spec_json, workspace_path,
+                summary, last_error, created_at_ms, updated_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(id) DO UPDATE SET
+                organization_id = excluded.organization_id,
+                state = excluded.state,
+                title = excluded.title,
+                intent = excluded.intent,
+                spec_json = excluded.spec_json,
+                workspace_path = excluded.workspace_path,
+                summary = excluded.summary,
+                last_error = excluded.last_error,
+                created_at_ms = excluded.created_at_ms,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                task.id.0,
+                task.organization_id.0,
+                enum_to_db(&task.state)?,
+                task.title,
+                task.intent,
+                serde_json::to_string(&task.spec)?,
+                task.workspace_path,
+                task.summary,
+                task.last_error,
+                ms_to_i64(task.created_at_ms)?,
+                ms_to_i64(task.updated_at_ms)?,
+            ],
+        )?;
+
+        tx.execute(
+            "DELETE FROM artifacts WHERE task_id = ?1",
+            params![task.id.0],
+        )?;
+        for (position, artifact) in task.artifacts.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO artifacts (task_id, position, kind, path) VALUES (?1, ?2, ?3, ?4)",
+                params![task.id.0, position as i64, artifact.kind, artifact.path],
+            )?;
+        }
+
+        tx.execute("DELETE FROM outputs WHERE task_id = ?1", params![task.id.0])?;
+        for (position, output) in task.outputs.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO outputs (
+                    id, task_id, position, kind, title, body, source_artifacts_json,
+                    created_at_ms, updated_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    output.id.0,
+                    task.id.0,
+                    position as i64,
+                    enum_to_db(&output.kind)?,
+                    output.title,
+                    output.body,
+                    serde_json::to_string(&output.source_artifacts)?,
+                    ms_to_i64(output.created_at_ms)?,
+                    ms_to_i64(output.updated_at_ms)?,
+                ],
+            )?;
+        }
+
+        tx.execute("DELETE FROM records WHERE task_id = ?1", params![task.id.0])?;
+        for (position, record) in task.records.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO records (
+                    id, task_id, position, kind, subject_json, body_json, created_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    record.id.0,
+                    task.id.0,
+                    position as i64,
+                    enum_to_db(&record.kind)?,
+                    serde_json::to_string(&record.subject)?,
+                    serde_json::to_string(&record.body)?,
+                    ms_to_i64(record.created_at_ms)?,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
         Ok(())
     }
 
     async fn load(&self, id: &TaskId) -> Result<Option<Task>> {
-        let path = self.task_path(id);
-        if !fs::try_exists(&path).await? {
-            return Ok(None);
-        }
-        let data = fs::read(path).await?;
-        Ok(Some(serde_json::from_slice(&data)?))
+        let db = self.db.lock().await;
+        load_task(&db, id)
     }
 
     async fn list(&self) -> Result<Vec<Task>> {
-        let mut entries = fs::read_dir(self.root.join("tasks")).await?;
+        let db = self.db.lock().await;
+        let mut stmt = db.prepare("SELECT id FROM tasks ORDER BY created_at_ms")?;
+        let ids = stmt
+            .query_map([], |row| Ok(TaskId(row.get::<_, String>(0)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
         let mut tasks = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            if entry.path().extension().and_then(|ext| ext.to_str()) == Some("json") {
-                let data = fs::read(entry.path()).await?;
-                tasks.push(serde_json::from_slice::<Task>(&data)?);
+        for id in ids {
+            if let Some(task) = load_task(&db, &id)? {
+                tasks.push(task);
             }
         }
-        tasks.sort_by_key(|task| task.created_at_ms);
         Ok(tasks)
     }
+}
 
-    async fn try_claim(&self, id: &TaskId) -> Result<bool> {
-        let mut claims = self.claims.lock().await;
-        if claims.contains_key(id) {
-            Ok(false)
-        } else {
-            claims.insert(id.clone(), ());
-            Ok(true)
-        }
+async fn try_claim(claims: &Claims, id: &TaskId) -> bool {
+    let mut claims = claims.lock().await;
+    if claims.contains_key(id) {
+        false
+    } else {
+        claims.insert(id.clone(), ());
+        true
     }
+}
 
-    async fn release_claim(&self, id: &TaskId) {
-        self.claims.lock().await.remove(id);
-    }
+async fn release_claim(claims: &Claims, id: &TaskId) {
+    claims.lock().await.remove(id);
+}
 
-    fn task_path(&self, id: &TaskId) -> PathBuf {
-        self.root.join("tasks").join(format!("{id}.json"))
-    }
+fn migrate(db: &Connection) -> Result<()> {
+    db.execute_batch(
+        "PRAGMA foreign_keys = ON;
+        CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY,
+            organization_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            title TEXT NOT NULL,
+            intent TEXT NOT NULL,
+            spec_json TEXT NOT NULL,
+            workspace_path TEXT,
+            summary TEXT,
+            last_error TEXT,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS artifacts (
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            position INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            path TEXT NOT NULL,
+            PRIMARY KEY (task_id, position)
+        );
+        CREATE TABLE IF NOT EXISTS outputs (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            position INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            source_artifacts_json TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_outputs_task_position ON outputs(task_id, position);
+        CREATE TABLE IF NOT EXISTS records (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            position INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            subject_json TEXT NOT NULL,
+            body_json TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_records_task_position ON records(task_id, position);",
+    )?;
+    Ok(())
+}
+
+fn load_task(db: &Connection, id: &TaskId) -> Result<Option<Task>> {
+    let Some(mut task) = db
+        .query_row(
+            "SELECT organization_id, state, title, intent, spec_json, workspace_path,
+                summary, last_error, created_at_ms, updated_at_ms
+             FROM tasks WHERE id = ?1",
+            params![id.0],
+            |row| {
+                let state: String = row.get(1)?;
+                let spec_json: String = row.get(4)?;
+                Ok(Task {
+                    id: id.clone(),
+                    organization_id: OrganizationId(row.get(0)?),
+                    state: db_enum(&state).map_err(rusqlite::Error::ToSqlConversionFailure)?,
+                    title: row.get(2)?,
+                    intent: row.get(3)?,
+                    spec: serde_json::from_str(&spec_json)
+                        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+                    workspace_path: row.get(5)?,
+                    summary: row.get(6)?,
+                    artifacts: Vec::new(),
+                    outputs: Vec::new(),
+                    records: Vec::new(),
+                    last_error: row.get(7)?,
+                    created_at_ms: i64_to_ms(row.get(8)?),
+                    updated_at_ms: i64_to_ms(row.get(9)?),
+                })
+            },
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+
+    task.artifacts = load_artifacts(db, id)?;
+    task.outputs = load_outputs(db, id)?;
+    task.records = load_records(db, id)?;
+    Ok(Some(task))
+}
+
+fn load_artifacts(db: &Connection, id: &TaskId) -> Result<Vec<Artifact>> {
+    let mut stmt =
+        db.prepare("SELECT kind, path FROM artifacts WHERE task_id = ?1 ORDER BY position")?;
+    Ok(stmt
+        .query_map(params![id.0], |row| {
+            Ok(Artifact {
+                kind: row.get(0)?,
+                path: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+fn load_outputs(db: &Connection, id: &TaskId) -> Result<Vec<TaskOutput>> {
+    let mut stmt = db.prepare(
+        "SELECT id, kind, title, body, source_artifacts_json, created_at_ms, updated_at_ms
+         FROM outputs WHERE task_id = ?1 ORDER BY position",
+    )?;
+    Ok(stmt
+        .query_map(params![id.0], |row| {
+            let kind: String = row.get(1)?;
+            let source_artifacts_json: String = row.get(4)?;
+            Ok(TaskOutput {
+                id: OutputId(row.get(0)?),
+                kind: db_enum(&kind).map_err(rusqlite::Error::ToSqlConversionFailure)?,
+                title: row.get(2)?,
+                body: row.get(3)?,
+                source_artifacts: serde_json::from_str(&source_artifacts_json)
+                    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+                created_at_ms: i64_to_ms(row.get(5)?),
+                updated_at_ms: i64_to_ms(row.get(6)?),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+fn load_records(db: &Connection, id: &TaskId) -> Result<Vec<TaskRecord>> {
+    let mut stmt = db.prepare(
+        "SELECT id, kind, subject_json, body_json, created_at_ms
+         FROM records WHERE task_id = ?1 ORDER BY position",
+    )?;
+    Ok(stmt
+        .query_map(params![id.0], |row| {
+            let kind: String = row.get(1)?;
+            let subject_json: String = row.get(2)?;
+            let body_json: String = row.get(3)?;
+            Ok(TaskRecord {
+                id: RecordId(row.get(0)?),
+                kind: db_enum(&kind).map_err(rusqlite::Error::ToSqlConversionFailure)?,
+                subject: serde_json::from_str(&subject_json)
+                    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+                body: serde_json::from_str(&body_json)
+                    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+                created_at_ms: i64_to_ms(row.get(4)?),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+fn enum_to_db<T: serde::Serialize>(value: &T) -> Result<String> {
+    Ok(serde_json::to_string(value)?.trim_matches('"').to_string())
+}
+
+fn db_enum<T: serde::de::DeserializeOwned>(
+    value: &str,
+) -> std::result::Result<T, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(serde_json::from_str(&format!("\"{value}\""))?)
+}
+
+fn ms_to_i64(value: u128) -> Result<i64> {
+    i64::try_from(value).context("timestamp does not fit in sqlite INTEGER")
+}
+
+fn i64_to_ms(value: i64) -> u128 {
+    u128::try_from(value).unwrap_or_default()
 }
 
 #[derive(Debug)]
@@ -858,6 +1153,8 @@ mod tests {
             workspace_path: None,
             summary: None,
             artifacts: Vec::new(),
+            outputs: Vec::new(),
+            records: Vec::new(),
             last_error: None,
             created_at_ms: 0,
             updated_at_ms: 0,
