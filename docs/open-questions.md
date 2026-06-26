@@ -2,9 +2,15 @@
 
 Answer these when they become implementation blockers.
 
+## Resolved decisions
+
+- Initial Rust crate layout is a Cargo workspace with `workctl` (CLI), `workd`
+  (control-plane daemon), and `workctl-core` (shared domain types and trait
+  seams). Add storage, harness, executor, and integration crates only when their
+  boundaries need real implementations.
+
 ## Core implementation
 
-- Rust crate layout: single crate or Cargo workspace split?
 - CLI-to-`workd` protocol: Unix socket, HTTPS, JSON-RPC, gRPC, SSH tunnel?
 - Auth mechanism: local defaults, tokens, mTLS, SSO, SSH tunnel?
 - Role model: org admins, members, service accounts, workers.

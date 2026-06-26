@@ -1,0 +1,12 @@
+[package]
+name = "workd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "workctl control-plane daemon."
+
+[dependencies]
+workctl-core.workspace = true
+
+[lints]
+workspace = true

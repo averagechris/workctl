@@ -37,7 +37,7 @@
       # binaries here as the workspace grows.
       workctl = pkgs.rustPlatform.buildRustPackage {
         pname = "workctl";
-        version = rootCargoToml.package.version;
+        version = rootCargoToml.workspace.package.version;
         src = self;
         cargoLock.lockFile = ./Cargo.lock;
         doCheck = false;

@@ -1,11 +1,15 @@
-[package]
-name = "workctl"
+[workspace]
+members = ["crates/workctl", "crates/workctl-core", "crates/workd"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A Rust control plane for delegated software-development tasks."
 
-[dependencies]
-
-[lints.rust]
+[workspace.lints.rust]
 unsafe_code = "forbid"
+
+[workspace.dependencies]
+workctl-core = { path = "crates/workctl-core", version = "0.1.0" }
