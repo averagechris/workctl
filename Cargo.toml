@@ -1,0 +1,11 @@
+[package]
+name = "workctl"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A Rust control plane for delegated software-development tasks."
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"

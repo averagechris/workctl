@@ -1,0 +1,9 @@
+lints = [
+  { name = "nix format", command = "alejandra --check flake.nix" },
+  { name = "nix static analysis", command = "deadnix --fail . && statix check ." },
+  { name = "rust format", command = "cargo fmt --all -- --check" },
+  { name = "rust static analysis", command = "cargo clippy --all-targets --all-features -- -D warnings" },
+  { name = "rust dependency hygiene", command = "cargo sort --workspace --check && cargo machete --with-metadata --skip-target-dir" },
+  { name = "rust dependency policy", command = "cargo deny check bans licenses sources" },
+  { name = "rust security audit", command = "cargo audit --deny warnings" },
+]

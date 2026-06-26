@@ -44,3 +44,30 @@ ownership, sessions, outputs, artifacts, cleanup policy, and handoff history.
 
 These docs are intentionally concise. They are meant to guide contributors and
 their agents as implementation begins, not to pre-design every subsystem.
+
+## Development
+
+This project uses a Nix flake for its development environment and package
+outputs. With direnv installed:
+
+```sh
+direnv allow
+```
+
+Without direnv, enter the shell directly:
+
+```sh
+nix develop
+```
+
+Static pre-push checks are configured for `jj lint`. They intentionally run
+formatters and static analysis for Rust and Nix code, not the full test suite.
+
+The dev shell also includes dependency-management and supply-chain tooling:
+
+- `cargo audit` for RustSec vulnerability audits.
+- `cargo deny` for dependency policy, licenses, bans, and source checks.
+- `cargo machete` for finding unused dependencies.
+- `cargo outdated` for finding available dependency updates.
+- `cargo add` / `cargo rm` / `cargo upgrade` from `cargo-edit`.
+- `cargo sort` for keeping dependency tables sorted.
