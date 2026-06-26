@@ -16,6 +16,9 @@ This document states baseline requirements and decisions.
   auth defaults.
 - SQLite is acceptable when one `workd` owns the DB. Postgres remains available
   for deployments that need it. Never share a SQLite file across machines.
+- The first implementation stores daemon-owned state as JSON task records under a
+  local state directory. This is an implementation scaffold for the local
+  vertical slice; replacing it with SQLite should not change CLI semantics.
 
 ## Dynamic config
 
@@ -54,6 +57,16 @@ This document states baseline requirements and decisions.
   Kubernetes, other backends.
 - Harness and executor are independent. A harness starts inside a prepared
   execution context.
+- First-pass executor support is `local-devshell`: per-task local directories
+  with redirected `HOME`, XDG cache/config, temp paths, cloned repos, generated
+  prompts, and artifact output. It uses `nix develop` for repos with `flake.nix`
+  and a direct process otherwise.
+- First-pass harness support includes a deterministic `fake-summary` test harness
+  and an `opencode-acp` harness that drives `opencode acp` over newline-delimited
+  ACP JSON-RPC.
+- The first OpenCode harness mounts local OpenCode config/data by symlink when
+  present. This is a local-dev convenience for credentials, not a final secret
+  distribution model.
 
 ## Safety and cleanup
 

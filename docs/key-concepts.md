@@ -147,3 +147,24 @@ Completed-task resources may be archived/deleted automatically when gates pass:
 
 When gates fail, cleanup is skipped or surfaced as attention if user input is
 useful.
+
+## First local implementation pass
+
+The current working slice intentionally favors a complete local task flow over a
+complete distributed control plane:
+
+```text
+workctl submit
+  -> HTTP request to local workd
+  -> JSON task record under the daemon state dir
+  -> embedded workd worker loop claims created task
+  -> local-devshell context preparation clones repos and writes prompt/manifest
+  -> fake-summary or opencode-acp harness runs in the prepared context
+  -> summary and protocol/context artifacts are written back to the task
+```
+
+This preserves the architectural seams from the north-star docs while keeping the
+first pass inspectable. The JSON file store, single-node HTTP transport, and
+embedded worker are not the final deployment model; the durable semantics that
+should survive replacement are task submission through `workd`, explicit context
+preparation, executor/harness separation, and artifact-backed outputs.

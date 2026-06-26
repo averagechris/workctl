@@ -71,3 +71,39 @@ The dev shell also includes dependency-management and supply-chain tooling:
 - `cargo outdated` for finding available dependency updates.
 - `cargo add` / `cargo rm` / `cargo upgrade` from `cargo-edit`.
 - `cargo sort` for keeping dependency tables sorted.
+
+## First local vertical slice
+
+The first implementation pass provides a local-only end-to-end path:
+
+1. Start the daemon and embedded worker loop:
+
+   ```sh
+   workd serve --bind 127.0.0.1:7878
+   ```
+
+2. Submit a repository-summary task through the CLI:
+
+   ```sh
+   workctl submit \
+     --title "Summarize linear-cli" \
+     --intent "Clone the repository and summarize its purpose, structure, commands, dependencies, and notable implementation details." \
+     --repo git@git.sr.ht:~averagechris/linear-cli \
+     --repo-name linear-cli \
+     --harness opencode-acp \
+     --wait
+   ```
+
+`workd` owns state under `${XDG_DATA_HOME:-~/.local/share}/workctl` by default.
+Each task gets a local workspace with cloned repos, a generated prompt, artifacts,
+and redirected `HOME` / XDG / temp paths for process-level isolation. The
+OpenCode harness symlinks host OpenCode config/data into those redirected XDG
+paths when present so local credentials can be used without copying secret files
+into the workspace. If the primary repo has a `flake.nix`, the OpenCode ACP
+harness is started through
+`nix develop <repo> --command opencode acp --cwd <repo>`; otherwise it is started
+directly.
+
+The default test path uses `--harness fake-summary` so CI does not need network,
+SSH, or LLM credentials. The real Sourcehut/OpenCode E2E is ignored by default
+and can be run explicitly with `WORKCTL_E2E_OPENCODE=1 cargo test -- --ignored`.

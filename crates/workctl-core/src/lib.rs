@@ -1,4 +1,8 @@
-//! Core domain concepts and trait seams for `workctl`.
+//! Shared models and API payloads for the local `workctl` / `workd` slice.
+
+use serde::{Deserialize, Serialize};
+use std::fmt::{self, Display};
+use uuid::Uuid;
 
 /// Stable product sentence used by bootstrap binaries and docs.
 #[must_use]
@@ -6,129 +10,242 @@ pub fn product_sentence() -> &'static str {
     "workctl is a Rust control plane for delegated software-development tasks"
 }
 
-/// Tenant boundary for users, tasks, repos, nodes, config, artifacts, and policy.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Organization {
-    pub id: OrganizationId,
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TaskId(pub String);
+
+impl TaskId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(format!("task_{}", Uuid::new_v4().simple()))
+    }
+}
+
+impl Default for TaskId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Display for TaskId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrganizationId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionContextId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoSpec {
+    pub url: String,
     pub name: String,
+    pub checkout: Option<String>,
 }
 
-/// Human or service identity authenticated to the control plane.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct User {
-    pub id: UserId,
-    pub organization_id: OrganizationId,
-    pub display_name: String,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessSpec {
+    pub kind: HarnessKind,
 }
 
-/// Machine or execution environment that can prepare contexts or run sessions.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Node {
-    pub id: NodeId,
-    pub organization_id: OrganizationId,
-    pub name: String,
+impl Default for HarnessSpec {
+    fn default() -> Self {
+        Self {
+            kind: HarnessKind::OpencodeAcp,
+        }
+    }
 }
 
-/// Durable record of delegated development work.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessKind {
+    OpencodeAcp,
+    FakeSummary,
+}
+
+impl Display for HarnessKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OpencodeAcp => f.write_str("opencode-acp"),
+            Self::FakeSummary => f.write_str("fake-summary"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorSpec {
+    pub kind: ExecutorKind,
+}
+
+impl Default for ExecutorSpec {
+    fn default() -> Self {
+        Self {
+            kind: ExecutorKind::LocalDevshell,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutorKind {
+    LocalDevshell,
+}
+
+impl Display for ExecutorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LocalDevshell => f.write_str("local-devshell"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSpec {
+    pub repos: Vec<RepoSpec>,
+    pub harness: HarnessSpec,
+    pub executor: ExecutorSpec,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    Created,
+    ContextRequested,
+    ContextReady,
+    Running,
+    ReviewReady,
+    Failed,
+    Done,
+}
+
+impl TaskState {
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::ReviewReady | Self::Failed | Self::Done)
+    }
+}
+
+impl Display for TaskState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = serde_json::to_string(self).map_err(|_| fmt::Error)?;
+        f.write_str(state.trim_matches('"'))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Artifact {
+    pub kind: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
     pub organization_id: OrganizationId,
     pub state: TaskState,
     pub title: String,
     pub intent: String,
+    pub spec: TaskSpec,
+    pub workspace_path: Option<String>,
+    pub summary: Option<String>,
+    pub artifacts: Vec<Artifact>,
+    pub last_error: Option<String>,
+    pub created_at_ms: u128,
+    pub updated_at_ms: u128,
 }
 
-/// Minimal task lifecycle from creation through completion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskState {
-    Created,
-    MetadataReady,
-    ContextRequested,
-    ContextReady,
-    Running,
-    ReviewReady,
-    NeedsUser,
-    Failed,
-    Done,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitTaskRequest {
+    pub title: String,
+    pub intent: String,
+    pub repos: Vec<RepoSpec>,
+    #[serde(default)]
+    pub harness: HarnessSpec,
+    #[serde(default)]
+    pub executor: ExecutorSpec,
 }
 
-/// Persisted record for a prepared task environment.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecutionContext {
-    pub id: ExecutionContextId,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitTaskResponse {
     pub task_id: TaskId,
-    pub runtime_handle: RuntimeHandle,
-    pub manifest_artifact_id: ArtifactId,
+    pub state: TaskState,
 }
 
-/// Backend-specific reference to an allocated runtime.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeHandle {
-    pub backend: String,
-    pub handle: String,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthResponse {
+    pub ok: bool,
+    pub product: String,
 }
 
-/// Large file/object stored outside the DB with a pointer/checksum.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Artifact {
-    pub id: ArtifactId,
-    pub uri: String,
-    pub checksum: Option<String>,
+#[derive(Debug, thiserror::Error)]
+pub enum ApiError {
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+    #[error("daemon error: {0}")]
+    Daemon(String),
 }
 
-/// Canonical state storage boundary.
-pub trait ControlStore {
-    type Error;
-
-    fn create_task(&mut self, task: Task) -> Result<(), Self::Error>;
-    fn task(&self, id: &TaskId) -> Result<Option<Task>, Self::Error>;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextManifest {
+    pub task_id: TaskId,
+    pub executor: ExecutorKind,
+    pub harness: HarnessKind,
+    pub workspace_path: String,
+    pub repos: Vec<PreparedRepo>,
+    pub artifact_dir: String,
+    pub prompt_path: String,
+    pub devshell: DevshellManifest,
 }
 
-/// External issue or work item provider boundary.
-pub trait IssueTracker {
-    type Error;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedRepo {
+    pub name: String,
+    pub url: String,
+    pub path: String,
+    pub checkout: Option<String>,
 }
 
-/// Orchestrates runtime allocation, mounts, context files, and manifests.
-pub trait ContextPreparer {
-    type Error;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevshellManifest {
+    pub mode: DevshellMode,
+    pub command: Vec<String>,
 }
 
-/// Stores and retrieves artifacts outside the control-plane database.
-pub trait ArtifactStore {
-    type Error;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DevshellMode {
+    NixDevelop,
+    DirectProcess,
 }
 
-/// Adapter for an agent protocol or coding loop.
-pub trait AgentHarness {
-    type Error;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_state_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&TaskState::ContextReady).unwrap(),
+            "\"context_ready\""
+        );
+    }
+
+    #[test]
+    fn ids_are_prefixed() {
+        assert!(TaskId::new().0.starts_with("task_"));
+    }
 }
-
-/// Runtime implementation boundary.
-pub trait ExecutorBackend {
-    type Error;
-}
-
-/// Dynamic config and cleanup/safety policy boundary.
-pub trait PolicyEngine {
-    type Error;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OrganizationId(pub String);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UserId(pub String);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeId(pub String);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaskId(pub String);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecutionContextId(pub String);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactId(pub String);
