@@ -61,6 +61,7 @@ fn cli_submits_task_to_workd_loop_with_fake_harness() {
 
     let task: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(task["state"], "done");
+    assert_eq!(task["user_id"], "local");
     assert!(task["summary"].as_str().unwrap().contains("README.md"));
     assert_eq!(task["outputs"][0]["kind"], "summary");
     assert!(
@@ -73,7 +74,100 @@ fn cli_submits_task_to_workd_loop_with_fake_harness() {
         record["kind"] == "input_received" && record["subject"]["kind"] == "task"
     }));
     assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "input_received"
+            && record["body"]["spec"]["repos"][0]["name"] == "fixture"
+    }));
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "input_received" && record["body"]["user_id"] == "local"
+    }));
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "task_claimed"
+            && record["body"]["claim_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("claim_")
+            && record["body"]["node_id"] == "local"
+    }));
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "task_released"
+            && record["body"]["claim_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("claim_")
+            && record["body"]["node_id"] == "local"
+    }));
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "action_started"
+            && record["subject"]["kind"] == "action"
+            && record["subject"]["id"]
+                .as_str()
+                .unwrap()
+                .starts_with("action_")
+    }));
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "action_completed"
+            && record["subject"]["kind"] == "action"
+            && record["body"]["kind"] == "process-created-task"
+    }));
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
         record["kind"] == "output_created" && record["subject"]["kind"] == "output"
+    }));
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "output_created"
+            && record["body"]["session_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("sess_")
+    }));
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "session_started" && record["subject"]["kind"] == "session"
+    }));
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "session_started"
+            && record["body"]["action_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("action_")
+            && record["body"]["context_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("ctx_")
+            && record["body"]["runtime_handle"]["kind"] == "local-devshell"
+    }));
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "session_completed" && record["subject"]["kind"] == "session"
+    }));
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "context_prepared"
+            && record["body"]["action_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("action_")
+            && record["body"]["runtime_handle"]["kind"] == "local-devshell"
+    }));
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "artifact_created" && record["subject"]["kind"] == "artifact"
+    }));
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "artifact_created" && record["body"]["kind"] == "prompt"
+    }));
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "artifact_created"
+            && record["body"]["kind"] == "prompt"
+            && record["body"]["source"]["kind"] == "context"
+    }));
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "artifact_created"
+            && record["body"]["kind"] == "summary"
+            && record["body"]["source"]["kind"] == "session"
+    }));
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "state_changed"
+            && record["body"]["to"] == "done"
+            && record["body"]["action_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("action_")
     }));
     let workspace = task["workspace_path"].as_str().unwrap();
     assert!(Path::new(workspace).join("repos/fixture/.git").exists());
@@ -82,6 +176,14 @@ fn cli_submits_task_to_workd_loop_with_fake_harness() {
             .join("artifacts/context-manifest.json")
             .exists()
     );
+    let manifest: Value = serde_json::from_slice(
+        &std::fs::read(Path::new(workspace).join("artifacts/context-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(manifest["context_id"].as_str().unwrap().starts_with("ctx_"));
+    assert_eq!(manifest["node_id"], "local");
+    assert_eq!(manifest["runtime_handle"]["kind"], "local-devshell");
+    assert!(Path::new(workspace).join("prompts/task.md").exists());
     assert!(Path::new(workspace).join("artifacts/summary.md").exists());
 }
 
@@ -150,6 +252,19 @@ fn e2e_opencode_summarizes_linear_cli() {
     assert!(task["records"].as_array().unwrap().iter().any(|record| {
         record["kind"] == "output_created" && record["subject"]["kind"] == "output"
     }));
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "artifact_created" && record["subject"]["kind"] == "artifact"
+    }));
+    assert!(task["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "artifact_created" && record["body"]["kind"] == "prompt"
+    }));
+    assert!(
+        task["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| { record["kind"] == "state_changed" && record["body"]["to"] == "done" })
+    );
     let workspace = task["workspace_path"].as_str().unwrap();
     assert!(Path::new(workspace).join("repos/linear-cli/.git").exists());
     assert!(

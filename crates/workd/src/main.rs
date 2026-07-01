@@ -28,13 +28,16 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use workctl_core::{
-    Artifact, ContextManifest, DevshellManifest, DevshellMode, HarnessKind, HealthResponse,
-    OrganizationId, OutputId, OutputKind, PreparedRepo, RecordId, RecordSubject, RepoSpec,
-    SubmitTaskRequest, SubmitTaskResponse, Task, TaskId, TaskOutput, TaskRecord, TaskRecordKind,
-    TaskSpec, TaskState, product_sentence,
+    ActionId, Artifact, ContextManifest, DevshellManifest, DevshellMode, ExecutionContextId,
+    HarnessKind, HealthResponse, NodeId, OrganizationId, OutputId, OutputKind, PreparedRepo,
+    RecordId, RecordSubject, RepoSpec, RuntimeHandle, SessionId, SubmitTaskRequest,
+    SubmitTaskResponse, Task, TaskId, TaskOutput, TaskRecord, TaskRecordKind, TaskSpec, TaskState,
+    UserId, product_sentence,
 };
 
 const DEFAULT_BIND: &str = "127.0.0.1:7878";
+const LOCAL_NODE_ID: &str = "local";
+const LOCAL_USER_ID: &str = "local";
 const WORKER_TICK_MS: u64 = 500;
 const OPENCODE_TIMEOUT_SECS: u64 = 900;
 
@@ -65,10 +68,14 @@ struct ServeArgs {
 #[derive(Clone)]
 struct AppState {
     store: Arc<dyn ControlStore>,
-    claims: Claims,
+    policy: Arc<dyn PolicyEngine>,
+    lifecycle: Arc<dyn TaskLifecycle>,
+    artifact_store: Arc<dyn ArtifactStore>,
+    context_preparer: Arc<dyn ContextPreparer>,
+    harness_runner: Arc<dyn AgentHarness>,
+    action_queue: Arc<dyn ActionQueue>,
+    claim_manager: Arc<dyn ClaimManager>,
 }
-
-type Claims = Arc<Mutex<HashMap<TaskId, ()>>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -87,9 +94,22 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let state_dir = args.state_dir.unwrap_or_else(default_state_dir);
     fs::create_dir_all(&state_dir).await?;
     let store: Arc<dyn ControlStore> = Arc::new(SqliteStore::new(state_dir).await?);
+    let artifact_store: Arc<dyn ArtifactStore> = Arc::new(LocalArtifactStore);
+    let executor: Arc<dyn ExecutorBackend> = Arc::new(LocalDevshellExecutorBackend);
+    let source_materializer: Arc<dyn SourceMaterializer> = Arc::new(LocalGitSourceMaterializer);
     let state = AppState {
         store,
-        claims: Arc::new(Mutex::new(HashMap::new())),
+        policy: Arc::new(LocalPolicyEngine),
+        lifecycle: Arc::new(LocalTaskLifecycle),
+        artifact_store: artifact_store.clone(),
+        context_preparer: Arc::new(LocalDevshellContextPreparer::new(
+            executor,
+            source_materializer,
+            artifact_store.clone(),
+        )),
+        harness_runner: Arc::new(LocalAgentHarness::new(artifact_store.clone())),
+        action_queue: Arc::new(LocalCreatedTaskQueue),
+        claim_manager: Arc::new(InMemoryClaimManager::default()),
     };
 
     if !args.disable_worker {
@@ -122,30 +142,31 @@ async fn submit_task(
     State(state): State<AppState>,
     Json(request): Json<SubmitTaskRequest>,
 ) -> Result<Json<SubmitTaskResponse>, AppError> {
-    if request.title.trim().is_empty() {
-        return Err(AppError::bad_request("title is required"));
-    }
-    if request.intent.trim().is_empty() {
-        return Err(AppError::bad_request("intent is required"));
-    }
-    if request.repos.is_empty() {
-        return Err(AppError::bad_request("at least one repo is required"));
-    }
+    let decision = state.policy.evaluate_submission(&request).await?;
 
     let now = now_ms();
     let title = request.title;
     let intent = request.intent;
+    let spec = TaskSpec {
+        repos: request.repos,
+        harness: request.harness,
+        executor: request.executor,
+    };
+    let input_record_body = json!({
+        "title": title.clone(),
+        "intent": intent.clone(),
+        "organization_id": decision.organization_id.clone(),
+        "user_id": decision.user_id.clone(),
+        "spec": spec.clone(),
+    });
     let task = Task {
         id: TaskId::new(),
-        organization_id: OrganizationId("local".into()),
+        organization_id: decision.organization_id,
+        user_id: decision.user_id,
         state: TaskState::Created,
         title: title.clone(),
         intent: intent.clone(),
-        spec: TaskSpec {
-            repos: request.repos,
-            harness: request.harness,
-            executor: request.executor,
-        },
+        spec,
         workspace_path: None,
         summary: None,
         artifacts: Vec::new(),
@@ -154,7 +175,7 @@ async fn submit_task(
             id: RecordId::new(),
             kind: TaskRecordKind::InputReceived,
             subject: RecordSubject::Task,
-            body: json!({"title": title, "intent": intent}),
+            body: input_record_body,
             created_at_ms: now,
         }],
         last_error: None,
@@ -186,42 +207,441 @@ async fn list_tasks(State(state): State<AppState>) -> Result<Json<Vec<Task>>, Ap
 
 async fn worker_loop(state: AppState, interval: Duration) {
     loop {
-        if let Err(err) = worker_tick(state.store.as_ref(), &state.claims).await {
+        if let Err(err) = worker_tick(&state).await {
             error!(?err, "worker tick failed");
         }
         tokio::time::sleep(interval).await;
     }
 }
 
-async fn worker_tick(store: &dyn ControlStore, claims: &Claims) -> Result<()> {
-    let tasks = store.list().await?;
-    for task in tasks {
-        if task.state == TaskState::Created && try_claim(claims, &task.id).await {
-            let task_id = task.id.clone();
-            process_task(store, task).await;
-            release_claim(claims, &task_id).await;
-            return Ok(());
+async fn worker_tick(state: &AppState) -> Result<()> {
+    let store = state.store.as_ref();
+    if let Some(claimed) = state
+        .action_queue
+        .claim_next(store, state.claim_manager.as_ref())
+        .await?
+    {
+        let mut task = claimed.task;
+        state
+            .lifecycle
+            .record_claimed(store, &mut task, &claimed.claim)
+            .await?;
+        state
+            .lifecycle
+            .record_action_started(store, &mut task, &claimed.action_id, &claimed.claim)
+            .await?;
+        let failure = process_task(
+            store,
+            state.lifecycle.as_ref(),
+            state.artifact_store.as_ref(),
+            state.context_preparer.as_ref(),
+            state.harness_runner.as_ref(),
+            &claimed.action_id,
+            task,
+        )
+        .await;
+        if let Some(error) = failure {
+            state
+                .lifecycle
+                .record_action_failed(store, &claimed.action_id, &claimed.claim, &error)
+                .await?;
+        } else {
+            state
+                .lifecycle
+                .record_action_completed(store, &claimed.action_id, &claimed.claim)
+                .await?;
         }
+        state
+            .lifecycle
+            .record_released(store, &claimed.claim)
+            .await?;
+        state.claim_manager.release(claimed.claim).await;
     }
     Ok(())
 }
 
-async fn process_task(store: &dyn ControlStore, mut task: Task) {
+async fn process_task(
+    store: &dyn ControlStore,
+    lifecycle: &dyn TaskLifecycle,
+    artifact_store: &dyn ArtifactStore,
+    context_preparer: &dyn ContextPreparer,
+    harness_runner: &dyn AgentHarness,
+    action_id: &ActionId,
+    mut task: Task,
+) -> Option<String> {
     let result = async {
-        mark(store, &mut task, TaskState::ContextRequested).await?;
-        let prepared = prepare_context(store, &mut task).await?;
-        mark(store, &mut task, TaskState::ContextReady).await?;
-        mark(store, &mut task, TaskState::Running).await?;
-        let summary = run_harness(&task, &prepared).await?;
+        lifecycle
+            .transition(
+                store,
+                &mut task,
+                TaskState::ContextRequested,
+                Some(action_id),
+            )
+            .await?;
+        let prepared = context_preparer
+            .prepare(store, &mut task, action_id)
+            .await?;
+        lifecycle
+            .transition(store, &mut task, TaskState::ContextReady, Some(action_id))
+            .await?;
+        lifecycle
+            .transition(store, &mut task, TaskState::Running, Some(action_id))
+            .await?;
+        let session_id = lifecycle
+            .start_session(store, &mut task, action_id, &prepared.manifest)
+            .await?;
+        let harness_run = match harness_runner.run(&task, &prepared).await {
+            Ok(run) => {
+                lifecycle
+                    .complete_session(store, &mut task, &session_id, &run)
+                    .await?;
+                run
+            }
+            Err(err) => {
+                lifecycle
+                    .fail_session(store, &mut task, &session_id, &err)
+                    .await?;
+                return Err(err);
+            }
+        };
         let summary_path = prepared.artifact_dir.join("summary.md");
-        fs::write(&summary_path, &summary).await?;
-        task.summary = Some(summary.clone());
+        artifact_store
+            .write_bytes(&summary_path, harness_run.summary.as_bytes())
+            .await?;
         let summary_artifact_path = summary_path.display().to_string();
-        task.artifacts.push(Artifact {
-            kind: "summary".into(),
-            path: summary_artifact_path.clone(),
-        });
+        lifecycle
+            .complete_with_summary(
+                store,
+                &mut task,
+                &session_id,
+                action_id,
+                harness_run.summary,
+                summary_artifact_path,
+                harness_run.artifacts,
+            )
+            .await?;
+        Result::<()>::Ok(())
+    }
+    .await;
+
+    if let Err(err) = result {
+        error!(task_id = %task.id, ?err, "task failed");
+        let error = format!("{err:#}");
+        if let Err(save_err) = lifecycle
+            .fail(store, &mut task, &err, Some(action_id))
+            .await
+        {
+            error!(?save_err, "failed to persist failed task");
+        }
+        Some(error)
+    } else {
+        None
+    }
+}
+
+struct ClaimedTask {
+    action_id: ActionId,
+    task: Task,
+    claim: TaskClaim,
+}
+
+#[async_trait]
+trait ActionQueue: Send + Sync {
+    async fn claim_next(
+        &self,
+        store: &dyn ControlStore,
+        claim_manager: &dyn ClaimManager,
+    ) -> Result<Option<ClaimedTask>>;
+}
+
+struct LocalCreatedTaskQueue;
+
+#[async_trait]
+impl ActionQueue for LocalCreatedTaskQueue {
+    async fn claim_next(
+        &self,
+        store: &dyn ControlStore,
+        claim_manager: &dyn ClaimManager,
+    ) -> Result<Option<ClaimedTask>> {
+        for task in store.list().await? {
+            if task.state == TaskState::Created
+                && let Some(claim) = claim_manager.try_claim(&task.id).await
+            {
+                return Ok(Some(ClaimedTask {
+                    action_id: ActionId::new(),
+                    task,
+                    claim,
+                }));
+            }
+        }
+        Ok(None)
+    }
+}
+
+struct TaskClaim {
+    claim_id: String,
+    task_id: TaskId,
+}
+
+#[async_trait]
+trait ClaimManager: Send + Sync {
+    async fn try_claim(&self, task_id: &TaskId) -> Option<TaskClaim>;
+    async fn release(&self, claim: TaskClaim);
+}
+
+#[derive(Default)]
+struct InMemoryClaimManager {
+    claims: Mutex<HashMap<TaskId, ()>>,
+}
+
+#[async_trait]
+impl ClaimManager for InMemoryClaimManager {
+    async fn try_claim(&self, task_id: &TaskId) -> Option<TaskClaim> {
+        let mut claims = self.claims.lock().await;
+        if claims.contains_key(task_id) {
+            None
+        } else {
+            claims.insert(task_id.clone(), ());
+            Some(TaskClaim {
+                claim_id: format!("claim_{}", RecordId::new().0.trim_start_matches("rec_")),
+                task_id: task_id.clone(),
+            })
+        }
+    }
+
+    async fn release(&self, claim: TaskClaim) {
+        self.claims.lock().await.remove(&claim.task_id);
+    }
+}
+
+#[async_trait]
+trait TaskLifecycle: Send + Sync {
+    async fn record_claimed(
+        &self,
+        store: &dyn ControlStore,
+        task: &mut Task,
+        claim: &TaskClaim,
+    ) -> Result<()>;
+
+    async fn record_released(&self, store: &dyn ControlStore, claim: &TaskClaim) -> Result<()>;
+
+    async fn record_action_started(
+        &self,
+        store: &dyn ControlStore,
+        task: &mut Task,
+        action_id: &ActionId,
+        claim: &TaskClaim,
+    ) -> Result<()>;
+
+    async fn record_action_completed(
+        &self,
+        store: &dyn ControlStore,
+        action_id: &ActionId,
+        claim: &TaskClaim,
+    ) -> Result<()>;
+
+    async fn record_action_failed(
+        &self,
+        store: &dyn ControlStore,
+        action_id: &ActionId,
+        claim: &TaskClaim,
+        error: &str,
+    ) -> Result<()>;
+
+    async fn transition(
+        &self,
+        store: &dyn ControlStore,
+        task: &mut Task,
+        state: TaskState,
+        action_id: Option<&ActionId>,
+    ) -> Result<()>;
+
+    async fn complete_with_summary(
+        &self,
+        store: &dyn ControlStore,
+        task: &mut Task,
+        session_id: &SessionId,
+        action_id: &ActionId,
+        summary: String,
+        summary_artifact_path: String,
+        harness_artifacts: Vec<GeneratedArtifact>,
+    ) -> Result<()>;
+
+    async fn start_session(
+        &self,
+        store: &dyn ControlStore,
+        task: &mut Task,
+        action_id: &ActionId,
+        manifest: &ContextManifest,
+    ) -> Result<SessionId>;
+
+    async fn complete_session(
+        &self,
+        store: &dyn ControlStore,
+        task: &mut Task,
+        session_id: &SessionId,
+        run: &HarnessRun,
+    ) -> Result<()>;
+
+    async fn fail_session(
+        &self,
+        store: &dyn ControlStore,
+        task: &mut Task,
+        session_id: &SessionId,
+        err: &anyhow::Error,
+    ) -> Result<()>;
+
+    async fn fail(
+        &self,
+        store: &dyn ControlStore,
+        task: &mut Task,
+        err: &anyhow::Error,
+        action_id: Option<&ActionId>,
+    ) -> Result<()>;
+}
+
+struct LocalTaskLifecycle;
+
+#[async_trait]
+impl TaskLifecycle for LocalTaskLifecycle {
+    async fn record_claimed(
+        &self,
+        store: &dyn ControlStore,
+        task: &mut Task,
+        claim: &TaskClaim,
+    ) -> Result<()> {
         let now = now_ms();
+        task.records.push(TaskRecord {
+            id: RecordId::new(),
+            kind: TaskRecordKind::TaskClaimed,
+            subject: RecordSubject::Task,
+            body: json!({
+                "claim_id": claim.claim_id.clone(),
+                "node_id": LOCAL_NODE_ID,
+            }),
+            created_at_ms: now,
+        });
+        task.updated_at_ms = now;
+        store.save(task).await
+    }
+
+    async fn record_released(&self, store: &dyn ControlStore, claim: &TaskClaim) -> Result<()> {
+        let Some(mut task) = store.load(&claim.task_id).await? else {
+            return Ok(());
+        };
+        let now = now_ms();
+        task.records.push(TaskRecord {
+            id: RecordId::new(),
+            kind: TaskRecordKind::TaskReleased,
+            subject: RecordSubject::Task,
+            body: json!({
+                "claim_id": claim.claim_id.clone(),
+                "node_id": LOCAL_NODE_ID,
+            }),
+            created_at_ms: now,
+        });
+        task.updated_at_ms = now;
+        store.save(&task).await
+    }
+
+    async fn record_action_started(
+        &self,
+        store: &dyn ControlStore,
+        task: &mut Task,
+        action_id: &ActionId,
+        claim: &TaskClaim,
+    ) -> Result<()> {
+        let now = now_ms();
+        task.records.push(TaskRecord {
+            id: RecordId::new(),
+            kind: TaskRecordKind::ActionStarted,
+            subject: RecordSubject::Action(action_id.clone()),
+            body: json!({
+                "kind": "process-created-task",
+                "claim_id": claim.claim_id.clone(),
+                "node_id": LOCAL_NODE_ID,
+            }),
+            created_at_ms: now,
+        });
+        task.updated_at_ms = now;
+        store.save(task).await
+    }
+
+    async fn record_action_completed(
+        &self,
+        store: &dyn ControlStore,
+        action_id: &ActionId,
+        claim: &TaskClaim,
+    ) -> Result<()> {
+        record_action_finished(
+            store,
+            action_id,
+            claim,
+            TaskRecordKind::ActionCompleted,
+            None,
+        )
+        .await
+    }
+
+    async fn record_action_failed(
+        &self,
+        store: &dyn ControlStore,
+        action_id: &ActionId,
+        claim: &TaskClaim,
+        error: &str,
+    ) -> Result<()> {
+        record_action_finished(
+            store,
+            action_id,
+            claim,
+            TaskRecordKind::ActionFailed,
+            Some(error),
+        )
+        .await
+    }
+
+    async fn transition(
+        &self,
+        store: &dyn ControlStore,
+        task: &mut Task,
+        state: TaskState,
+        action_id: Option<&ActionId>,
+    ) -> Result<()> {
+        let previous_state = task.state;
+        task.state = state;
+        task.updated_at_ms = now_ms();
+        record_state_change(task, previous_state, state, action_id, task.updated_at_ms);
+        store.save(task).await
+    }
+
+    async fn complete_with_summary(
+        &self,
+        store: &dyn ControlStore,
+        task: &mut Task,
+        session_id: &SessionId,
+        action_id: &ActionId,
+        summary: String,
+        summary_artifact_path: String,
+        harness_artifacts: Vec<GeneratedArtifact>,
+    ) -> Result<()> {
+        task.summary = Some(summary.clone());
+        let now = now_ms();
+        for artifact in harness_artifacts {
+            register_artifact(
+                task,
+                artifact.kind,
+                artifact.path,
+                artifact_source_session(session_id),
+                now,
+            );
+        }
+        register_artifact(
+            task,
+            "summary",
+            summary_artifact_path.clone(),
+            artifact_source_session(session_id),
+            now,
+        );
         let output = TaskOutput {
             id: OutputId::new(),
             kind: OutputKind::Summary,
@@ -238,33 +658,425 @@ async fn process_task(store: &dyn ControlStore, mut task: Task) {
             body: json!({
                 "kind": output.kind,
                 "title": output.title,
+                "session_id": session_id,
                 "source_artifacts": output.source_artifacts,
             }),
             created_at_ms: now,
         });
         task.outputs.push(output);
+        let previous_state = task.state;
         task.state = TaskState::Done;
         task.updated_at_ms = now;
-        store.save(&task).await?;
-        Result::<()>::Ok(())
+        record_state_change(task, previous_state, TaskState::Done, Some(action_id), now);
+        store.save(task).await
     }
-    .await;
 
-    if let Err(err) = result {
-        error!(task_id = %task.id, ?err, "task failed");
+    async fn start_session(
+        &self,
+        store: &dyn ControlStore,
+        task: &mut Task,
+        action_id: &ActionId,
+        manifest: &ContextManifest,
+    ) -> Result<SessionId> {
+        let session_id = SessionId::new();
+        let now = now_ms();
+        task.records.push(TaskRecord {
+            id: RecordId::new(),
+            kind: TaskRecordKind::SessionStarted,
+            subject: RecordSubject::Session(session_id.clone()),
+            body: json!({
+                "action_id": action_id,
+                "harness": task.spec.harness.kind,
+                "executor": task.spec.executor.kind,
+                "context_id": manifest.context_id.clone(),
+                "node_id": manifest.node_id.clone(),
+                "runtime_handle": manifest.runtime_handle.clone(),
+            }),
+            created_at_ms: now,
+        });
+        task.updated_at_ms = now;
+        store.save(task).await?;
+        Ok(session_id)
+    }
+
+    async fn complete_session(
+        &self,
+        store: &dyn ControlStore,
+        task: &mut Task,
+        session_id: &SessionId,
+        run: &HarnessRun,
+    ) -> Result<()> {
+        let now = now_ms();
+        task.records.push(TaskRecord {
+            id: RecordId::new(),
+            kind: TaskRecordKind::SessionCompleted,
+            subject: RecordSubject::Session(session_id.clone()),
+            body: json!({
+                "summary_bytes": run.summary.len(),
+                "artifact_count": run.artifacts.len(),
+            }),
+            created_at_ms: now,
+        });
+        task.updated_at_ms = now;
+        store.save(task).await
+    }
+
+    async fn fail_session(
+        &self,
+        store: &dyn ControlStore,
+        task: &mut Task,
+        session_id: &SessionId,
+        err: &anyhow::Error,
+    ) -> Result<()> {
+        let now = now_ms();
+        task.records.push(TaskRecord {
+            id: RecordId::new(),
+            kind: TaskRecordKind::SessionFailed,
+            subject: RecordSubject::Session(session_id.clone()),
+            body: json!({"error": format!("{err:#}")}),
+            created_at_ms: now,
+        });
+        task.updated_at_ms = now;
+        store.save(task).await
+    }
+
+    async fn fail(
+        &self,
+        store: &dyn ControlStore,
+        task: &mut Task,
+        err: &anyhow::Error,
+        action_id: Option<&ActionId>,
+    ) -> Result<()> {
+        let previous_state = task.state;
         task.state = TaskState::Failed;
         task.last_error = Some(format!("{err:#}"));
         task.updated_at_ms = now_ms();
-        if let Err(save_err) = store.save(&task).await {
-            error!(?save_err, "failed to persist failed task");
+        record_state_change(
+            task,
+            previous_state,
+            TaskState::Failed,
+            action_id,
+            task.updated_at_ms,
+        );
+        store.save(task).await
+    }
+}
+
+async fn record_action_finished(
+    store: &dyn ControlStore,
+    action_id: &ActionId,
+    claim: &TaskClaim,
+    kind: TaskRecordKind,
+    error: Option<&str>,
+) -> Result<()> {
+    let Some(mut task) = store.load(&claim.task_id).await? else {
+        return Ok(());
+    };
+    let now = now_ms();
+    let mut body = json!({
+        "kind": "process-created-task",
+        "claim_id": claim.claim_id.clone(),
+        "node_id": LOCAL_NODE_ID,
+    });
+    if let Some(error) = error {
+        body["error"] = json!(error);
+    }
+    task.records.push(TaskRecord {
+        id: RecordId::new(),
+        kind,
+        subject: RecordSubject::Action(action_id.clone()),
+        body,
+        created_at_ms: now,
+    });
+    task.updated_at_ms = now;
+    store.save(&task).await
+}
+
+fn record_state_change(
+    task: &mut Task,
+    from: TaskState,
+    to: TaskState,
+    action_id: Option<&ActionId>,
+    now: u128,
+) {
+    let mut body = json!({"from": from, "to": to});
+    if let Some(action_id) = action_id {
+        body["action_id"] = json!(action_id);
+    }
+    task.records.push(TaskRecord {
+        id: RecordId::new(),
+        kind: TaskRecordKind::StateChanged,
+        subject: RecordSubject::Task,
+        body,
+        created_at_ms: now,
+    });
+}
+
+struct GeneratedArtifact {
+    kind: String,
+    path: String,
+}
+
+impl GeneratedArtifact {
+    fn new(kind: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            path: path.into(),
         }
     }
 }
 
-async fn mark(store: &dyn ControlStore, task: &mut Task, state: TaskState) -> Result<()> {
-    task.state = state;
-    task.updated_at_ms = now_ms();
-    store.save(task).await
+fn register_artifact(
+    task: &mut Task,
+    kind: impl Into<String>,
+    path: impl Into<String>,
+    source: Value,
+    now: u128,
+) {
+    let kind = kind.into();
+    let path = path.into();
+    task.artifacts.push(Artifact {
+        kind: kind.clone(),
+        path: path.clone(),
+    });
+    task.records.push(TaskRecord {
+        id: RecordId::new(),
+        kind: TaskRecordKind::ArtifactCreated,
+        subject: RecordSubject::Artifact(path.clone()),
+        body: json!({"kind": kind, "path": path, "source": source}),
+        created_at_ms: now,
+    });
+}
+
+fn artifact_source_context(context_id: &ExecutionContextId) -> Value {
+    json!({"kind": "context", "context_id": context_id})
+}
+
+fn artifact_source_session(session_id: &SessionId) -> Value {
+    json!({"kind": "session", "session_id": session_id})
+}
+
+fn record_context_prepared(
+    task: &mut Task,
+    action_id: &ActionId,
+    manifest: &ContextManifest,
+    manifest_path: String,
+    now: u128,
+) {
+    task.records.push(TaskRecord {
+        id: RecordId::new(),
+        kind: TaskRecordKind::ContextPrepared,
+        subject: RecordSubject::Task,
+        body: json!({
+            "action_id": action_id,
+            "context_id": manifest.context_id.clone(),
+            "node_id": manifest.node_id.clone(),
+            "executor": manifest.executor,
+            "harness": manifest.harness,
+            "runtime_handle": manifest.runtime_handle.clone(),
+            "workspace_path": manifest.workspace_path.clone(),
+            "repos": manifest.repos.clone(),
+            "artifact_dir": manifest.artifact_dir.clone(),
+            "prompt_path": manifest.prompt_path.clone(),
+            "manifest_path": manifest_path,
+        }),
+        created_at_ms: now,
+    });
+}
+
+#[async_trait]
+trait PolicyEngine: Send + Sync {
+    async fn evaluate_submission(
+        &self,
+        request: &SubmitTaskRequest,
+    ) -> std::result::Result<SubmissionDecision, AppError>;
+}
+
+struct SubmissionDecision {
+    organization_id: OrganizationId,
+    user_id: UserId,
+}
+
+struct LocalPolicyEngine;
+
+#[async_trait]
+impl PolicyEngine for LocalPolicyEngine {
+    async fn evaluate_submission(
+        &self,
+        request: &SubmitTaskRequest,
+    ) -> std::result::Result<SubmissionDecision, AppError> {
+        if request.title.trim().is_empty() {
+            return Err(AppError::bad_request("title is required"));
+        }
+        if request.intent.trim().is_empty() {
+            return Err(AppError::bad_request("intent is required"));
+        }
+        if request.repos.is_empty() {
+            return Err(AppError::bad_request("at least one repo is required"));
+        }
+
+        Ok(SubmissionDecision {
+            organization_id: OrganizationId("local".into()),
+            user_id: UserId(LOCAL_USER_ID.into()),
+        })
+    }
+}
+
+#[async_trait]
+trait ArtifactStore: Send + Sync {
+    async fn write_bytes(&self, path: &Path, contents: &[u8]) -> Result<()>;
+    async fn create_file(&self, path: &Path) -> Result<fs::File>;
+}
+
+struct LocalArtifactStore;
+
+#[async_trait]
+impl ArtifactStore for LocalArtifactStore {
+    async fn write_bytes(&self, path: &Path, contents: &[u8]) -> Result<()> {
+        ensure_parent_dir(path).await?;
+        fs::write(path, contents).await?;
+        Ok(())
+    }
+
+    async fn create_file(&self, path: &Path) -> Result<fs::File> {
+        ensure_parent_dir(path).await?;
+        Ok(fs::File::create(path).await?)
+    }
+}
+
+async fn ensure_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    Ok(())
+}
+
+#[async_trait]
+trait ContextPreparer: Send + Sync {
+    async fn prepare(
+        &self,
+        store: &dyn ControlStore,
+        task: &mut Task,
+        action_id: &ActionId,
+    ) -> Result<PreparedContext>;
+}
+
+struct LocalDevshellContextPreparer {
+    executor: Arc<dyn ExecutorBackend>,
+    source_materializer: Arc<dyn SourceMaterializer>,
+    artifact_store: Arc<dyn ArtifactStore>,
+}
+
+impl LocalDevshellContextPreparer {
+    fn new(
+        executor: Arc<dyn ExecutorBackend>,
+        source_materializer: Arc<dyn SourceMaterializer>,
+        artifact_store: Arc<dyn ArtifactStore>,
+    ) -> Self {
+        Self {
+            executor,
+            source_materializer,
+            artifact_store,
+        }
+    }
+}
+
+#[async_trait]
+impl ContextPreparer for LocalDevshellContextPreparer {
+    async fn prepare(
+        &self,
+        store: &dyn ControlStore,
+        task: &mut Task,
+        action_id: &ActionId,
+    ) -> Result<PreparedContext> {
+        prepare_context(
+            store,
+            task,
+            action_id,
+            self.executor.as_ref(),
+            self.source_materializer.as_ref(),
+            self.artifact_store.as_ref(),
+        )
+        .await
+    }
+}
+
+#[async_trait]
+trait SourceMaterializer: Send + Sync {
+    async fn materialize_repos(
+        &self,
+        repos: &[RepoSpec],
+        repos_dir: &Path,
+    ) -> Result<Vec<PreparedRepo>>;
+}
+
+struct LocalGitSourceMaterializer;
+
+#[async_trait]
+impl SourceMaterializer for LocalGitSourceMaterializer {
+    async fn materialize_repos(
+        &self,
+        repos: &[RepoSpec],
+        repos_dir: &Path,
+    ) -> Result<Vec<PreparedRepo>> {
+        let mut prepared_repos = Vec::new();
+        for repo in repos {
+            let destination = repos_dir.join(&repo.name);
+            clone_repo(repo, &destination).await?;
+            prepared_repos.push(PreparedRepo {
+                name: repo.name.clone(),
+                url: repo.url.clone(),
+                path: destination.display().to_string(),
+                checkout: repo.checkout.clone(),
+            });
+        }
+        Ok(prepared_repos)
+    }
+}
+
+#[async_trait]
+trait ExecutorBackend: Send + Sync {
+    async fn prepare_runtime(
+        &self,
+        workspace: &Path,
+        primary_repo: &Path,
+        harness: HarnessKind,
+    ) -> Result<RuntimePreparation>;
+}
+
+struct RuntimePreparation {
+    runtime_handle: RuntimeHandle,
+    devshell: DevshellManifest,
+}
+
+struct LocalDevshellExecutorBackend;
+
+#[async_trait]
+impl ExecutorBackend for LocalDevshellExecutorBackend {
+    async fn prepare_runtime(
+        &self,
+        workspace: &Path,
+        primary_repo: &Path,
+        harness: HarnessKind,
+    ) -> Result<RuntimePreparation> {
+        for dir in [
+            &workspace.join("home"),
+            &workspace.join("tmp"),
+            &workspace.join("xdg-cache"),
+            &workspace.join("xdg-config"),
+            &workspace.join("xdg-data"),
+        ] {
+            fs::create_dir_all(dir).await?;
+        }
+
+        Ok(RuntimePreparation {
+            runtime_handle: RuntimeHandle {
+                kind: "local-devshell".into(),
+                id: workspace.display().to_string(),
+            },
+            devshell: devshell_manifest(primary_repo, harness).await,
+        })
+    }
 }
 
 struct PreparedContext {
@@ -274,35 +1086,25 @@ struct PreparedContext {
     manifest: ContextManifest,
 }
 
-async fn prepare_context(store: &dyn ControlStore, task: &mut Task) -> Result<PreparedContext> {
+async fn prepare_context(
+    store: &dyn ControlStore,
+    task: &mut Task,
+    action_id: &ActionId,
+    executor: &dyn ExecutorBackend,
+    source_materializer: &dyn SourceMaterializer,
+    artifact_store: &dyn ArtifactStore,
+) -> Result<PreparedContext> {
     let workspace = store.workspace_root().join(task.id.to_string());
     let repos_dir = workspace.join("repos");
     let artifact_dir = workspace.join("artifacts");
     let prompt_dir = workspace.join("prompts");
-    for dir in [
-        &repos_dir,
-        &artifact_dir,
-        &prompt_dir,
-        &workspace.join("home"),
-        &workspace.join("tmp"),
-        &workspace.join("xdg-cache"),
-        &workspace.join("xdg-config"),
-        &workspace.join("xdg-data"),
-    ] {
+    for dir in [&repos_dir, &artifact_dir, &prompt_dir] {
         fs::create_dir_all(dir).await?;
     }
 
-    let mut prepared_repos = Vec::new();
-    for repo in &task.spec.repos {
-        let destination = repos_dir.join(&repo.name);
-        clone_repo(repo, &destination).await?;
-        prepared_repos.push(PreparedRepo {
-            name: repo.name.clone(),
-            url: repo.url.clone(),
-            path: destination.display().to_string(),
-            checkout: repo.checkout.clone(),
-        });
-    }
+    let prepared_repos = source_materializer
+        .materialize_repos(&task.spec.repos, &repos_dir)
+        .await?;
     let primary_repo = PathBuf::from(
         prepared_repos
             .first()
@@ -311,28 +1113,55 @@ async fn prepare_context(store: &dyn ControlStore, task: &mut Task) -> Result<Pr
             .clone(),
     );
     let prompt_path = prompt_dir.join("task.md");
-    fs::write(&prompt_path, render_prompt(task)).await?;
+    artifact_store
+        .write_bytes(&prompt_path, render_prompt(task).as_bytes())
+        .await?;
 
-    let devshell = devshell_manifest(&primary_repo, task.spec.harness.kind).await;
+    let runtime = executor
+        .prepare_runtime(&workspace, &primary_repo, task.spec.harness.kind)
+        .await?;
     let manifest = ContextManifest {
+        context_id: ExecutionContextId::new(),
         task_id: task.id.clone(),
+        node_id: NodeId(LOCAL_NODE_ID.into()),
         executor: task.spec.executor.kind,
         harness: task.spec.harness.kind,
+        runtime_handle: runtime.runtime_handle,
         workspace_path: workspace.display().to_string(),
         repos: prepared_repos,
         artifact_dir: artifact_dir.display().to_string(),
         prompt_path: prompt_path.display().to_string(),
-        devshell,
+        devshell: runtime.devshell,
     };
     let manifest_path = artifact_dir.join("context-manifest.json");
-    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?).await?;
+    artifact_store
+        .write_bytes(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)
+        .await?;
 
     task.workspace_path = Some(workspace.display().to_string());
-    task.artifacts.push(Artifact {
-        kind: "context-manifest".into(),
-        path: manifest_path.display().to_string(),
-    });
-    task.updated_at_ms = now_ms();
+    let now = now_ms();
+    register_artifact(
+        task,
+        "prompt",
+        prompt_path.display().to_string(),
+        artifact_source_context(&manifest.context_id),
+        now,
+    );
+    register_artifact(
+        task,
+        "context-manifest",
+        manifest_path.display().to_string(),
+        artifact_source_context(&manifest.context_id),
+        now,
+    );
+    record_context_prepared(
+        task,
+        action_id,
+        &manifest,
+        manifest_path.display().to_string(),
+        now,
+    );
+    task.updated_at_ms = now;
     store.save(task).await?;
 
     Ok(PreparedContext {
@@ -421,11 +1250,23 @@ async fn devshell_manifest(primary_repo: &Path, harness: HarnessKind) -> Devshel
     }
 }
 
-async fn run_harness(task: &Task, prepared: &PreparedContext) -> Result<String> {
+async fn run_harness(
+    task: &Task,
+    prepared: &PreparedContext,
+    artifact_store: Arc<dyn ArtifactStore>,
+) -> Result<HarnessRun> {
     match task.spec.harness.kind {
-        HarnessKind::FakeSummary => fake_summary(task, prepared).await,
-        HarnessKind::OpencodeAcp => run_opencode_acp(task, prepared).await,
+        HarnessKind::FakeSummary => Ok(HarnessRun {
+            summary: fake_summary(task, prepared).await?,
+            artifacts: Vec::new(),
+        }),
+        HarnessKind::OpencodeAcp => run_opencode_acp(task, prepared, artifact_store).await,
     }
+}
+
+struct HarnessRun {
+    summary: String,
+    artifacts: Vec<GeneratedArtifact>,
 }
 
 async fn fake_summary(task: &Task, prepared: &PreparedContext) -> Result<String> {
@@ -453,9 +1294,35 @@ async fn list_top_level_entries(path: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
-async fn run_opencode_acp(task: &Task, prepared: &PreparedContext) -> Result<String> {
+#[async_trait]
+trait AgentHarness: Send + Sync {
+    async fn run(&self, task: &Task, prepared: &PreparedContext) -> Result<HarnessRun>;
+}
+
+struct LocalAgentHarness {
+    artifact_store: Arc<dyn ArtifactStore>,
+}
+
+impl LocalAgentHarness {
+    fn new(artifact_store: Arc<dyn ArtifactStore>) -> Self {
+        Self { artifact_store }
+    }
+}
+
+#[async_trait]
+impl AgentHarness for LocalAgentHarness {
+    async fn run(&self, task: &Task, prepared: &PreparedContext) -> Result<HarnessRun> {
+        run_harness(task, prepared, self.artifact_store.clone()).await
+    }
+}
+
+async fn run_opencode_acp(
+    task: &Task,
+    prepared: &PreparedContext,
+    artifact_store: Arc<dyn ArtifactStore>,
+) -> Result<HarnessRun> {
     let log_path = prepared.artifact_dir.join("opencode-acp.ndjson");
-    let mut log = fs::File::create(&log_path).await?;
+    let mut log = artifact_store.create_file(&log_path).await?;
     let (program, args) = harness_command(&prepared.manifest)?;
     let workspace = prepared
         .primary_repo
@@ -482,6 +1349,8 @@ async fn run_opencode_acp(task: &Task, prepared: &PreparedContext) -> Result<Str
 
     let stderr = child.stderr.take().context("missing ACP stderr")?;
     let stderr_path = prepared.artifact_dir.join("opencode-acp.stderr.log");
+    let stderr_artifact_path = stderr_path.clone();
+    let stderr_artifact_store = artifact_store.clone();
     tokio::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
         let mut data = String::new();
@@ -489,7 +1358,10 @@ async fn run_opencode_acp(task: &Task, prepared: &PreparedContext) -> Result<Str
             data.push_str(&line);
             data.push('\n');
         }
-        if let Err(err) = fs::write(stderr_path, data).await {
+        if let Err(err) = stderr_artifact_store
+            .write_bytes(&stderr_path, data.as_bytes())
+            .await
+        {
             warn!(?err, "failed to write ACP stderr log");
         }
     });
@@ -556,7 +1428,16 @@ async fn run_opencode_acp(task: &Task, prepared: &PreparedContext) -> Result<Str
     if summary.trim().is_empty() {
         bail!("opencode ACP completed without agent text");
     }
-    Ok(summary)
+    Ok(HarnessRun {
+        summary,
+        artifacts: vec![
+            GeneratedArtifact::new("opencode-acp-log", log_path.display().to_string()),
+            GeneratedArtifact::new(
+                "opencode-acp-stderr",
+                stderr_artifact_path.display().to_string(),
+            ),
+        ],
+    })
 }
 
 async fn mount_opencode_state(workspace: &Path) -> Result<()> {
@@ -767,11 +1648,12 @@ impl ControlStore for SqliteStore {
         let tx = db.transaction()?;
         tx.execute(
             "INSERT INTO tasks (
-                id, organization_id, state, title, intent, spec_json, workspace_path,
+                id, organization_id, user_id, state, title, intent, spec_json, workspace_path,
                 summary, last_error, created_at_ms, updated_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT(id) DO UPDATE SET
                 organization_id = excluded.organization_id,
+                user_id = excluded.user_id,
                 state = excluded.state,
                 title = excluded.title,
                 intent = excluded.intent,
@@ -784,6 +1666,7 @@ impl ControlStore for SqliteStore {
             params![
                 task.id.0,
                 task.organization_id.0,
+                task.user_id.0,
                 enum_to_db(&task.state)?,
                 task.title,
                 task.intent,
@@ -871,26 +1754,13 @@ impl ControlStore for SqliteStore {
     }
 }
 
-async fn try_claim(claims: &Claims, id: &TaskId) -> bool {
-    let mut claims = claims.lock().await;
-    if claims.contains_key(id) {
-        false
-    } else {
-        claims.insert(id.clone(), ());
-        true
-    }
-}
-
-async fn release_claim(claims: &Claims, id: &TaskId) {
-    claims.lock().await.remove(id);
-}
-
 fn migrate(db: &Connection) -> Result<()> {
     db.execute_batch(
         "PRAGMA foreign_keys = ON;
         CREATE TABLE IF NOT EXISTS tasks (
             id TEXT PRIMARY KEY,
             organization_id TEXT NOT NULL,
+            user_id TEXT NOT NULL DEFAULT 'local',
             state TEXT NOT NULL,
             title TEXT NOT NULL,
             intent TEXT NOT NULL,
@@ -931,35 +1801,51 @@ fn migrate(db: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_records_task_position ON records(task_id, position);",
     )?;
+    ensure_column(db, "tasks", "user_id", "TEXT NOT NULL DEFAULT 'local'")?;
+    Ok(())
+}
+
+fn ensure_column(db: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let mut stmt = db.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|name| name == column) {
+        db.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
     Ok(())
 }
 
 fn load_task(db: &Connection, id: &TaskId) -> Result<Option<Task>> {
     let Some(mut task) = db
         .query_row(
-            "SELECT organization_id, state, title, intent, spec_json, workspace_path,
+            "SELECT organization_id, user_id, state, title, intent, spec_json, workspace_path,
                 summary, last_error, created_at_ms, updated_at_ms
              FROM tasks WHERE id = ?1",
             params![id.0],
             |row| {
-                let state: String = row.get(1)?;
-                let spec_json: String = row.get(4)?;
+                let state: String = row.get(2)?;
+                let spec_json: String = row.get(5)?;
                 Ok(Task {
                     id: id.clone(),
                     organization_id: OrganizationId(row.get(0)?),
+                    user_id: UserId(row.get(1)?),
                     state: db_enum(&state).map_err(rusqlite::Error::ToSqlConversionFailure)?,
-                    title: row.get(2)?,
-                    intent: row.get(3)?,
+                    title: row.get(3)?,
+                    intent: row.get(4)?,
                     spec: serde_json::from_str(&spec_json)
                         .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-                    workspace_path: row.get(5)?,
-                    summary: row.get(6)?,
+                    workspace_path: row.get(6)?,
+                    summary: row.get(7)?,
                     artifacts: Vec::new(),
                     outputs: Vec::new(),
                     records: Vec::new(),
-                    last_error: row.get(7)?,
-                    created_at_ms: i64_to_ms(row.get(8)?),
-                    updated_at_ms: i64_to_ms(row.get(9)?),
+                    last_error: row.get(8)?,
+                    created_at_ms: i64_to_ms(row.get(9)?),
+                    updated_at_ms: i64_to_ms(row.get(10)?),
                 })
             },
         )
@@ -1124,9 +2010,15 @@ mod tests {
             artifact_dir: temp.path().to_path_buf(),
             prompt_path: temp.path().join("prompt.md"),
             manifest: ContextManifest {
+                context_id: ExecutionContextId("ctx_test".into()),
                 task_id: TaskId("task_test".into()),
+                node_id: NodeId(LOCAL_NODE_ID.into()),
                 executor: workctl_core::ExecutorKind::LocalDevshell,
                 harness: HarnessKind::FakeSummary,
+                runtime_handle: RuntimeHandle {
+                    kind: "local-devshell".into(),
+                    id: temp.path().display().to_string(),
+                },
                 workspace_path: temp.path().display().to_string(),
                 repos: Vec::new(),
                 artifact_dir: temp.path().display().to_string(),
@@ -1140,6 +2032,7 @@ mod tests {
         let task = Task {
             id: TaskId("task_test".into()),
             organization_id: OrganizationId("local".into()),
+            user_id: UserId(LOCAL_USER_ID.into()),
             state: TaskState::Running,
             title: "test".into(),
             intent: "summarize".into(),

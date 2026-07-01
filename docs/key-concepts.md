@@ -184,3 +184,93 @@ artifact-backed large data.
 `workd` accesses persistence through a `ControlStore` trait. The local
 implementation is SQLite-backed, while worker claims remain an in-memory
 single-daemon mechanism until leases/actions become durable store records.
+
+Context preparation and harness execution are also represented as daemon-local
+trait seams in the first pass. `LocalDevshellContextPreparer` owns the current
+workspace/repo/prompt/manifest preparation path, while the local `AgentHarness`
+implementation dispatches to `fake-summary` or `opencode-acp` based on the task
+spec. `LocalDevshellExecutorBackend` owns the current process-runtime setup:
+per-task `HOME`, XDG, temp directories, and the dev-shell command manifest.
+`SourceMaterializer` owns source preparation; the first implementation clones Git
+repos into the task workspace and applies optional checkout hints.
+
+Prepared contexts include a backend-specific runtime handle in the context
+manifest. For the first `local-devshell` backend, the handle kind is
+`local-devshell` and the handle ID is the task workspace path; future executors
+can replace this with process groups, container IDs, pods, or VM identifiers.
+Each manifest also has a generated `ExecutionContextId` (`ctx_...`) so prepared
+contexts have stable control-plane identity before execution contexts are split
+into their own normalized store records.
+The initial local implementation records node identity as static node ID `local`
+in each context manifest. Future node registration/configuration can replace
+this with durable node records, capabilities, and ownership/heartbeat metadata.
+Context preparation also appends a `context_prepared` task record containing the
+launching `action_id`, execution context ID, node ID, runtime handle, prepared
+repos, key paths, and manifest path. This makes prepared context history
+replayable even before execution contexts have their own store table.
+
+Accepted task inputs are snapshotted into an `input_received` record containing
+the submitted title, intent, repos, harness, and executor spec. The task row is
+the queryable current view; the record preserves the accepted request for replay,
+audit, and future projections.
+
+The first local identity model assigns submitted tasks to organization `local`
+and user `local`. The user ID is stored on the task row and included in the
+`input_received` snapshot so later auth/user resolution can replace the local
+default without losing audit semantics.
+
+Submit-time validation and default scoping run through a `PolicyEngine` trait.
+The first local policy preserves the existing CLI/API behavior: title, intent,
+and at least one repo are required, and accepted tasks are assigned to the
+default `local` organization. Dynamic configuration and richer policy precedence
+can attach at this boundary without moving validation back into HTTP handlers.
+
+Worker-driven state updates run through a `TaskLifecycle` trait. The initial
+implementation keeps the local sequence (`created -> context_requested ->
+context_ready -> running -> done|failed`) and centralizes summary output creation
+plus failure persistence outside the worker loop. Future user, integration, or
+admin-driven transitions should attach to this lifecycle authority rather than
+mutating task state ad hoc. Each lifecycle transition also appends a
+`state_changed` task record with `from` and `to` states so task history is
+replayable instead of only materialized in the current task row. Worker-driven
+state changes include the responsible `action_id`.
+
+Harness attempts are represented as sessions in the task record stream. The
+first local implementation generates a `SessionId` (`sess_...`) when the harness
+starts and appends `session_started`, `session_completed`, or `session_failed`
+records. `session_started` records include the launching `action_id` plus the
+`context_id`, `node_id`, and `runtime_handle` for the prepared context where the
+attempt ran. Session state is not normalized yet; the record stream is the
+durable history for the local slice. Summary `output_created` records include
+the producing `session_id`, preserving output provenance back to the exact
+harness attempt.
+
+Worker task ownership is represented by a `ClaimManager` trait. The first
+implementation is an in-memory single-daemon claim map, matching the local worker
+loop behavior. Durable leases, heartbeats, expiry, and takeover rules should
+replace this implementation without changing worker orchestration. The local
+worker appends `task_claimed` and `task_released` records with a generated claim
+ID and node ID so ownership history is visible even before leases are durable.
+
+Worker action selection is represented by an `ActionQueue` trait. The first local
+queue scans for `created` tasks and claims the first available one, matching the
+current embedded worker. Durable action records, priorities, retries, capability
+filters, and observation-driven requeueing should replace this implementation
+without changing task processing. Locally selected work is assigned an `ActionId`
+(`action_...`) and recorded with `action_started`, `action_completed`, or
+`action_failed` task records that include claim and node metadata. Failed action
+records include the concrete task-processing error for debugging.
+
+Generated context files, harness logs, and large generated data are written
+through an `ArtifactStore` trait. The first implementation is local filesystem
+storage in each task workspace: generated prompts live under `prompts/`, while
+context manifests, summaries, and protocol logs live under `artifacts/`. Harness
+runs return summary text plus generated artifact pointers, so protocol-level logs
+such as OpenCode ACP NDJSON/stderr can be registered with the task. The store
+boundary is intentionally small so later backends can add checksums, retention,
+encryption, or remote object storage without changing task output records.
+Artifact pointers are also mirrored into append-only `artifact_created` task
+records so current artifact state can be rebuilt alongside outputs and
+projections. Artifact records include source provenance: context-generated
+artifacts point at the `context_id`, while harness and summary artifacts point at
+the producing `session_id`.
