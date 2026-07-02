@@ -274,6 +274,90 @@ fn e2e_opencode_summarizes_linear_cli() {
     );
 }
 
+#[test]
+fn cli_watch_streams_records_until_terminal_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("source-repo");
+    create_git_repo(&repo);
+
+    let bind = free_addr();
+    let state_dir = temp.path().join("state");
+    let mut workd_command = cargo_run("workd");
+    let mut workd = workd_command
+        .arg("serve")
+        .arg("--bind")
+        .arg(&bind)
+        .arg("--state-dir")
+        .arg(&state_dir)
+        .arg("--worker-interval-ms")
+        .arg("100")
+        .spawn()
+        .unwrap();
+
+    wait_for_workd(&bind);
+
+    let mut submit_command = cargo_run("workctl");
+    let submit_output = submit_command
+        .arg("--server")
+        .arg(format!("http://{bind}"))
+        .arg("--json")
+        .arg("submit")
+        .arg("--title")
+        .arg("Watch fixture")
+        .arg("--intent")
+        .arg("Summarize this fixture repository")
+        .arg("--repo")
+        .arg(repo.display().to_string())
+        .arg("--harness")
+        .arg("fake-summary")
+        .output()
+        .unwrap();
+    assert!(
+        submit_output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&submit_output.stderr)
+    );
+    let submitted: Value = serde_json::from_slice(&submit_output.stdout).unwrap();
+    let task_id = submitted["task_id"].as_str().unwrap();
+
+    let mut watch_command = cargo_run("workctl");
+    let watch_output = watch_command
+        .arg("--server")
+        .arg(format!("http://{bind}"))
+        .arg("task")
+        .arg("watch")
+        .arg(task_id)
+        .arg("--timeout-secs")
+        .arg("30")
+        .output()
+        .unwrap();
+
+    kill(&mut workd);
+    assert!(
+        watch_output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&watch_output.stdout),
+        String::from_utf8_lossy(&watch_output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&watch_output.stdout);
+    assert!(stdout.contains("input_received"), "stdout={stdout}");
+    assert!(
+        stdout.contains("state_changed created -> context_requested"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("state_changed running -> done"),
+        "stdout={stdout}"
+    );
+    assert!(stdout.contains("context_prepared"), "stdout={stdout}");
+    assert!(stdout.contains("output_created"), "stdout={stdout}");
+    assert!(
+        stdout.contains(&format!("task {task_id} done")),
+        "stdout={stdout}"
+    );
+    assert!(stdout.contains("README.md"), "stdout={stdout}");
+}
+
 fn create_git_repo(path: &Path) {
     std::fs::create_dir_all(path).unwrap();
     std::fs::write(path.join("README.md"), "# Fixture\n").unwrap();

@@ -93,6 +93,9 @@ Answer these when they become implementation blockers.
 - Control-plane lifecycle: auto-start local `workd`, configured server, or both?
 - Bootstrap config/state paths: XDG layout, Nix module shape, secrets wiring.
 - Runtime config propagation: how do workers observe config changes?
+- Remote observation transport: `task watch` currently tails the harness log
+  from the shared local filesystem; remote deployments need a server-side
+  event/log streaming mechanism.
 
 ## Context and execution
 

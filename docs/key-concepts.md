@@ -214,6 +214,16 @@ the submitted title, intent, repos, harness, and executor spec. The task row is
 the queryable current view; the record preserves the accepted request for replay,
 audit, and future projections.
 
+Live observation in the local slice is `workctl task watch <id>` (or `submit
+--watch`). The CLI polls the task and prints each newly appended task record,
+so state changes, context preparation, sessions, outputs, and artifacts stream
+as they happen; `--json` emits the records as NDJSON. When the opencode-acp
+protocol log is visible on the local filesystem, watch also tails it and
+streams agent message text and tool-call titles between records. Reading the
+workspace log file directly is a local-milestone convenience that works because
+the CLI and daemon share a machine; a remote deployment needs an observation
+endpoint or artifact streaming instead.
+
 The first local identity model assigns submitted tasks to organization `local`
 and user `local`. The user ID is stored on the task row and included in the
 `input_received` snapshot so later auth/user resolution can replace the local

@@ -1,10 +1,14 @@
 use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
+use serde_json::Value;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::time::sleep;
 use workctl_core::{
     ExecutorKind, ExecutorSpec, HarnessKind, HarnessSpec, HealthResponse, RepoSpec,
-    SubmitTaskRequest, SubmitTaskResponse, Task, product_sentence,
+    SubmitTaskRequest, SubmitTaskResponse, Task, TaskRecord, TaskRecordKind, product_sentence,
 };
 
 const DEFAULT_SERVER: &str = "http://127.0.0.1:7878";
@@ -33,11 +37,24 @@ enum Command {
 #[derive(Debug, clap::Subcommand)]
 enum TaskCommand {
     Submit(SubmitArgs),
-    Get { task_id: String },
+    Get {
+        task_id: String,
+    },
     List,
-    Outputs { task_id: String },
-    Records { task_id: String },
-    Artifacts { task_id: String },
+    Watch {
+        task_id: String,
+        #[arg(long, default_value_t = 1800)]
+        timeout_secs: u64,
+    },
+    Outputs {
+        task_id: String,
+    },
+    Records {
+        task_id: String,
+    },
+    Artifacts {
+        task_id: String,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -56,6 +73,8 @@ struct SubmitArgs {
     executor: ExecutorArg,
     #[arg(long)]
     wait: bool,
+    #[arg(long)]
+    watch: bool,
     #[arg(long, default_value_t = 1800)]
     timeout_secs: u64,
 }
@@ -102,7 +121,19 @@ async fn main() -> Result<()> {
             command: TaskCommand::Submit(args),
         } => {
             let response = client.submit(&submit_request(&args)?).await?;
-            if args.wait {
+            if args.watch {
+                if !cli.json {
+                    println!("task {} {}", response.task_id, response.state);
+                }
+                let task = watch_task(
+                    &client,
+                    cli.json,
+                    &response.task_id.to_string(),
+                    args.timeout_secs,
+                )
+                .await?;
+                print_watch_final(cli.json, &task)?;
+            } else if args.wait {
                 let task =
                     wait_for_task(&client, response.task_id.to_string(), args.timeout_secs).await?;
                 print_task(cli.json, &task)?;
@@ -112,6 +143,16 @@ async fn main() -> Result<()> {
                     println!("task {} {}", response.task_id, response.state);
                 }
             }
+        }
+        Command::Task {
+            command:
+                TaskCommand::Watch {
+                    task_id,
+                    timeout_secs,
+                },
+        } => {
+            let task = watch_task(&client, cli.json, &task_id, timeout_secs).await?;
+            print_watch_final(cli.json, &task)?;
         }
         Command::Task {
             command: TaskCommand::Get { task_id },
@@ -231,6 +272,245 @@ async fn wait_for_task(client: &Client, task_id: String, timeout_secs: u64) -> R
     }
 }
 
+/// Follow a task live: stream new task records as they are appended and, when a
+/// local harness protocol log is visible, stream agent output from it. Returns
+/// the final task once it reaches a terminal state.
+async fn watch_task(client: &Client, json: bool, task_id: &str, timeout_secs: u64) -> Result<Task> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut printer = WatchPrinter::new(json);
+    let mut seen_records = 0_usize;
+    let mut log_tail: Option<HarnessLogTail> = None;
+
+    loop {
+        let task = client.get(task_id).await?;
+        if log_tail.is_none() {
+            log_tail = HarnessLogTail::discover(&task).await;
+        }
+        if let Some(tail) = &mut log_tail {
+            for event in tail.drain().await? {
+                printer.harness_event(&event);
+            }
+        }
+        for record in task.records.iter().skip(seen_records) {
+            printer.record(record, task.created_at_ms)?;
+        }
+        seen_records = task.records.len();
+
+        if task.state.is_terminal() {
+            if let Some(tail) = &mut log_tail {
+                for event in tail.drain().await? {
+                    printer.harness_event(&event);
+                }
+            }
+            printer.finish();
+            return Ok(task);
+        }
+        if Instant::now() >= deadline {
+            printer.finish();
+            bail!(
+                "timed out watching task {task_id}; last state was {}",
+                task.state
+            );
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+struct WatchPrinter {
+    json: bool,
+    /// True while the last thing printed was a streaming agent chunk without a
+    /// trailing newline, so structured lines can restore column zero first.
+    mid_stream: bool,
+}
+
+impl WatchPrinter {
+    fn new(json: bool) -> Self {
+        Self {
+            json,
+            mid_stream: false,
+        }
+    }
+
+    fn record(&mut self, record: &TaskRecord, task_created_at_ms: u128) -> Result<()> {
+        if self.json {
+            println!("{}", serde_json::to_string(record)?);
+            return Ok(());
+        }
+        self.break_stream();
+        let elapsed_ms = record.created_at_ms.saturating_sub(task_created_at_ms);
+        #[allow(clippy::cast_precision_loss)]
+        let elapsed_secs = elapsed_ms as f64 / 1000.0;
+        println!("[+{elapsed_secs:7.1}s] {}", render_record(record));
+        Ok(())
+    }
+
+    fn harness_event(&mut self, event: &HarnessEvent) {
+        if self.json {
+            return;
+        }
+        match event {
+            HarnessEvent::AgentText(text) => {
+                print!("{text}");
+                let _ = std::io::stdout().flush();
+                self.mid_stream = !text.ends_with('\n');
+            }
+            HarnessEvent::ToolCall(title) => {
+                self.break_stream();
+                println!("[harness] tool: {title}");
+            }
+        }
+    }
+
+    fn break_stream(&mut self) {
+        if self.mid_stream {
+            println!();
+            self.mid_stream = false;
+        }
+    }
+
+    fn finish(&mut self) {
+        self.break_stream();
+    }
+}
+
+fn render_record(record: &TaskRecord) -> String {
+    let kind = record_kind_label(record.kind);
+    let body = &record.body;
+    let detail = match record.kind {
+        TaskRecordKind::StateChanged => format!(
+            "{} -> {}",
+            body_str(body, "from").unwrap_or("?"),
+            body_str(body, "to").unwrap_or("?")
+        ),
+        TaskRecordKind::InputReceived => format!(
+            "title={:?} user={}",
+            body_str(body, "title").unwrap_or("?"),
+            body_str(body, "user_id").unwrap_or("?")
+        ),
+        TaskRecordKind::TaskClaimed | TaskRecordKind::TaskReleased => format!(
+            "claim={} node={}",
+            body_str(body, "claim_id").unwrap_or("?"),
+            body_str(body, "node_id").unwrap_or("?")
+        ),
+        TaskRecordKind::ContextPrepared => format!(
+            "context={} workspace={}",
+            body_str(body, "context_id").unwrap_or("?"),
+            body_str(body, "workspace_path").unwrap_or("?")
+        ),
+        TaskRecordKind::ArtifactCreated => format!(
+            "{} {}",
+            body_str(body, "kind").unwrap_or("?"),
+            body_str(body, "path").unwrap_or("?")
+        ),
+        TaskRecordKind::OutputCreated => body_str(body, "title").unwrap_or("?").to_string(),
+        TaskRecordKind::ActionFailed | TaskRecordKind::SessionFailed => {
+            format!("error: {}", body_str(body, "error").unwrap_or("?"))
+        }
+        _ => subject_label(record),
+    };
+    if detail.is_empty() {
+        kind
+    } else {
+        format!("{kind} {detail}")
+    }
+}
+
+fn record_kind_label(kind: TaskRecordKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|value| value.as_str().map(ToString::to_string))
+        .unwrap_or_else(|| format!("{kind:?}"))
+}
+
+fn subject_label(record: &TaskRecord) -> String {
+    match serde_json::to_value(&record.subject) {
+        Ok(value) => value
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        Err(_) => String::new(),
+    }
+}
+
+fn body_str<'a>(body: &'a Value, key: &str) -> Option<&'a str> {
+    body.get(key).and_then(Value::as_str)
+}
+
+enum HarnessEvent {
+    AgentText(String),
+    ToolCall(String),
+}
+
+/// Incrementally reads a locally visible harness protocol log
+/// (`opencode-acp.ndjson`) and turns agent message chunks and tool calls into
+/// printable events. Only works when the CLI shares a filesystem with the
+/// daemon, which is the current local milestone.
+struct HarnessLogTail {
+    path: PathBuf,
+    offset: u64,
+    partial: String,
+}
+
+impl HarnessLogTail {
+    async fn discover(task: &Task) -> Option<Self> {
+        let workspace = task.workspace_path.as_deref()?;
+        let path = Path::new(workspace)
+            .join("artifacts")
+            .join("opencode-acp.ndjson");
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            Some(Self {
+                path,
+                offset: 0,
+                partial: String::new(),
+            })
+        } else {
+            None
+        }
+    }
+
+    async fn drain(&mut self) -> Result<Vec<HarnessEvent>> {
+        let Ok(mut file) = tokio::fs::File::open(&self.path).await else {
+            return Ok(Vec::new());
+        };
+        file.seek(std::io::SeekFrom::Start(self.offset)).await?;
+        let mut bytes = Vec::new();
+        let read = file.read_to_end(&mut bytes).await?;
+        self.offset += read as u64;
+        self.partial.push_str(&String::from_utf8_lossy(&bytes));
+
+        let mut events = Vec::new();
+        while let Some(newline) = self.partial.find('\n') {
+            let line: String = self.partial.drain(..=newline).collect();
+            if let Some(event) = parse_harness_log_line(line.trim_end()) {
+                events.push(event);
+            }
+        }
+        Ok(events)
+    }
+}
+
+fn parse_harness_log_line(line: &str) -> Option<HarnessEvent> {
+    let payload = line.strip_prefix("agent ")?;
+    let message: Value = serde_json::from_str(payload).ok()?;
+    let update = message.pointer("/params/update")?;
+    match update.get("sessionUpdate").and_then(Value::as_str)? {
+        "agent_message_chunk" => update
+            .pointer("/content/text")
+            .and_then(Value::as_str)
+            .map(|text| HarnessEvent::AgentText(text.to_string())),
+        "tool_call" => {
+            let title = update
+                .get("title")
+                .and_then(Value::as_str)
+                .or_else(|| update.get("kind").and_then(Value::as_str))
+                .unwrap_or("unnamed tool call");
+            Some(HarnessEvent::ToolCall(title.to_string()))
+        }
+        _ => None,
+    }
+}
+
 fn print_value<T: serde::Serialize>(json: bool, value: &T) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(value)?);
@@ -251,6 +531,18 @@ fn print_task(json: bool, task: &Task) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Final line after a watch stream. In JSON mode the stream is NDJSON records,
+/// so the final task is emitted as a single compact JSON line rather than the
+/// pretty form used by `task get`.
+fn print_watch_final(json: bool, task: &Task) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(task)?);
+        Ok(())
+    } else {
+        print_task(false, task)
+    }
 }
 
 struct Client {
@@ -316,6 +608,7 @@ async fn decode_response<T: serde::de::DeserializeOwned>(response: reqwest::Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use workctl_core::{RecordId, RecordSubject, TaskState};
 
     #[test]
     fn infers_repo_names_from_ssh_urls() {
@@ -324,5 +617,56 @@ mod tests {
             "linear-cli"
         );
         assert_eq!(infer_repo_name("https://example.com/foo.git"), "foo");
+    }
+
+    #[test]
+    fn parses_agent_message_chunks_from_harness_log() {
+        let line = r#"agent {"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"}}}}"#;
+        match parse_harness_log_line(line) {
+            Some(HarnessEvent::AgentText(text)) => assert_eq!(text, "hello"),
+            other => panic!(
+                "expected agent text, got {:?}",
+                other.map(|event| match event {
+                    HarnessEvent::AgentText(text) => format!("text:{text}"),
+                    HarnessEvent::ToolCall(title) => format!("tool:{title}"),
+                })
+            ),
+        }
+    }
+
+    #[test]
+    fn parses_tool_calls_and_ignores_client_lines() {
+        let tool = r#"agent {"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","title":"read file"}}}"#;
+        assert!(matches!(
+            parse_harness_log_line(tool),
+            Some(HarnessEvent::ToolCall(title)) if title == "read file"
+        ));
+        let client = r#"client {"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#;
+        assert!(parse_harness_log_line(client).is_none());
+        assert!(parse_harness_log_line("not json").is_none());
+    }
+
+    #[test]
+    fn renders_state_change_records() {
+        let record = TaskRecord {
+            id: RecordId::new(),
+            kind: TaskRecordKind::StateChanged,
+            subject: RecordSubject::Task,
+            body: serde_json::json!({"from": TaskState::Running, "to": TaskState::Done}),
+            created_at_ms: 1,
+        };
+        assert_eq!(render_record(&record), "state_changed running -> done");
+    }
+
+    #[test]
+    fn renders_failure_records_with_error_detail() {
+        let record = TaskRecord {
+            id: RecordId::new(),
+            kind: TaskRecordKind::SessionFailed,
+            subject: RecordSubject::Task,
+            body: serde_json::json!({"error": "boom"}),
+            created_at_ms: 1,
+        };
+        assert_eq!(render_record(&record), "session_failed error: boom");
     }
 }
