@@ -2,9 +2,7 @@ use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
 use serde_json::Value;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::time::sleep;
 use workctl_core::{
     ExecutorKind, ExecutorSpec, HarnessKind, HarnessSpec, HealthResponse, RepoSpec,
@@ -161,7 +159,7 @@ async fn main() -> Result<()> {
             command: TaskCommand::Review { task_id },
         } => {
             let task = client.get(&task_id).await?;
-            review_task(cli.json, &task).await?;
+            review_task(&client, cli.json, &task).await?;
         }
         Command::Task {
             command: TaskCommand::Get { task_id },
@@ -281,9 +279,9 @@ async fn wait_for_task(client: &Client, task_id: String, timeout_secs: u64) -> R
     }
 }
 
-/// Follow a task live: stream new task records as they are appended and, when a
-/// local harness protocol log is visible, stream agent output from it. Returns
-/// the final task once it reaches a terminal state.
+/// Follow a task live: stream new task records as they are appended and tail
+/// the harness protocol log through the artifact content API. Returns the
+/// final task once it reaches a terminal state.
 async fn watch_task(client: &Client, json: bool, task_id: &str, timeout_secs: u64) -> Result<Task> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut printer = WatchPrinter::new(json);
@@ -293,10 +291,10 @@ async fn watch_task(client: &Client, json: bool, task_id: &str, timeout_secs: u6
     loop {
         let task = client.get(task_id).await?;
         if log_tail.is_none() {
-            log_tail = HarnessLogTail::discover(&task).await;
+            log_tail = HarnessLogTail::discover(&task);
         }
         if let Some(tail) = &mut log_tail {
-            for event in tail.drain().await? {
+            for event in tail.drain(client, task_id).await? {
                 printer.harness_event(&event);
             }
         }
@@ -307,7 +305,7 @@ async fn watch_task(client: &Client, json: bool, task_id: &str, timeout_secs: u6
 
         if task.state.is_terminal() {
             if let Some(tail) = &mut log_tail {
-                for event in tail.drain().await? {
+                for event in tail.drain(client, task_id).await? {
                     printer.harness_event(&event);
                 }
             }
@@ -451,41 +449,34 @@ enum HarnessEvent {
     ToolCall(String),
 }
 
-/// Incrementally reads a locally visible harness protocol log
-/// (`opencode-acp.ndjson`) and turns agent message chunks and tool calls into
-/// printable events. Only works when the CLI shares a filesystem with the
-/// daemon, which is the current local milestone.
+/// Incrementally fetches the harness protocol log (`opencode-acp-log`
+/// artifact) through the daemon's artifact content API and turns agent
+/// message chunks and tool calls into printable events. Works identically for
+/// local and remote daemons.
 struct HarnessLogTail {
-    path: PathBuf,
+    artifact_position: usize,
     offset: u64,
     partial: String,
 }
 
 impl HarnessLogTail {
-    async fn discover(task: &Task) -> Option<Self> {
-        let workspace = task.workspace_path.as_deref()?;
-        let path = Path::new(workspace)
-            .join("artifacts")
-            .join("opencode-acp.ndjson");
-        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            Some(Self {
-                path,
-                offset: 0,
-                partial: String::new(),
-            })
-        } else {
-            None
-        }
+    fn discover(task: &Task) -> Option<Self> {
+        let artifact_position = task
+            .artifacts
+            .iter()
+            .position(|artifact| artifact.kind == "opencode-acp-log")?;
+        Some(Self {
+            artifact_position,
+            offset: 0,
+            partial: String::new(),
+        })
     }
 
-    async fn drain(&mut self) -> Result<Vec<HarnessEvent>> {
-        let Ok(mut file) = tokio::fs::File::open(&self.path).await else {
-            return Ok(Vec::new());
-        };
-        file.seek(std::io::SeekFrom::Start(self.offset)).await?;
-        let mut bytes = Vec::new();
-        let read = file.read_to_end(&mut bytes).await?;
-        self.offset += read as u64;
+    async fn drain(&mut self, client: &Client, task_id: &str) -> Result<Vec<HarnessEvent>> {
+        let bytes = client
+            .artifact_content(task_id, self.artifact_position, self.offset)
+            .await?;
+        self.offset += bytes.len() as u64;
         self.partial.push_str(&String::from_utf8_lossy(&bytes));
 
         let mut events = Vec::new();
@@ -536,16 +527,19 @@ fn print_value<T: serde::Serialize>(json: bool, value: &T) -> Result<()> {
 }
 
 /// Review surface for a finished task: the summary output plus any captured
-/// repo diffs. Diff contents are read from the local filesystem, which works
-/// for the local single-machine milestone; remote deployments will need
-/// artifact retrieval through the control plane.
-async fn review_task(json: bool, task: &Task) -> Result<()> {
+/// repo diffs, fetched through the daemon's artifact content API so it works
+/// for local and remote daemons alike.
+async fn review_task(client: &Client, json: bool, task: &Task) -> Result<()> {
     let mut diffs = Vec::new();
-    for artifact in &task.artifacts {
+    for (position, artifact) in task.artifacts.iter().enumerate() {
         if artifact.kind != "repo-diff" {
             continue;
         }
-        let content = tokio::fs::read_to_string(&artifact.path).await.ok();
+        let content = client
+            .artifact_content(&task.id.to_string(), position, 0)
+            .await
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
         diffs.push((artifact.path.clone(), content));
     }
 
@@ -574,7 +568,7 @@ async fn review_task(json: bool, task: &Task) -> Result<()> {
     for (path, content) in &diffs {
         match content {
             Some(diff) => println!("\n## Diff: {path}\n\n{diff}"),
-            None => println!("\n## Diff: {path}\n\n(not readable from this machine)"),
+            None => println!("\n## Diff: {path}\n\n(content could not be fetched)"),
         }
     }
     Ok(())
@@ -634,6 +628,31 @@ impl Client {
 
     async fn list(&self) -> Result<Vec<Task>> {
         self.get_json("/tasks").await
+    }
+
+    /// Fetch artifact bytes from a byte offset via the daemon API.
+    async fn artifact_content(
+        &self,
+        task_id: &str,
+        position: usize,
+        offset: u64,
+    ) -> Result<Vec<u8>> {
+        let response = self
+            .http
+            .get(format!(
+                "{}/tasks/{task_id}/artifacts/{position}/content?offset={offset}",
+                self.base
+            ))
+            .send()
+            .await?;
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        if status.is_success() {
+            Ok(bytes.to_vec())
+        } else {
+            let body = String::from_utf8_lossy(&bytes);
+            bail!("workd returned {status}: {body}");
+        }
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {

@@ -21,7 +21,7 @@ use std::{
 };
 use tokio::{
     fs,
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::Mutex,
     time::timeout,
@@ -123,6 +123,10 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .route("/health", get(health))
         .route("/tasks", post(submit_task).get(list_tasks))
         .route("/tasks/{task_id}", get(get_task))
+        .route(
+            "/tasks/{task_id}/artifacts/{position}/content",
+            get(artifact_content),
+        )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
@@ -203,6 +207,64 @@ async fn get_task(
 
 async fn list_tasks(State(state): State<AppState>) -> Result<Json<Vec<Task>>, AppError> {
     Ok(Json(state.store.list().await?))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ArtifactContentQuery {
+    #[serde(default)]
+    offset: u64,
+}
+
+/// Serve artifact bytes from a byte offset. This is the transport used by
+/// remote `task watch` (tailing a growing harness log) and `task review`
+/// (fetching diffs), replacing shared-filesystem reads. The daemon owns the
+/// workspace filesystem; clients only ever see this endpoint.
+async fn artifact_content(
+    State(state): State<AppState>,
+    AxumPath((task_id, position)): AxumPath<(String, usize)>,
+    axum::extract::Query(query): axum::extract::Query<ArtifactContentQuery>,
+) -> Result<Response, AppError> {
+    let task = state
+        .store
+        .load(&TaskId(task_id.clone()))
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("task {task_id}")))?;
+    let artifact = task
+        .artifacts
+        .get(position)
+        .ok_or_else(|| AppError::not_found(format!("task {task_id} artifact {position}")))?;
+
+    let mut file = match fs::File::open(&artifact.path).await {
+        Ok(file) => file,
+        // Registered but not written yet (e.g. a harness log right after
+        // session start): present as empty rather than missing.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(empty_artifact_response());
+        }
+        Err(err) => return Err(AppError::from(anyhow!(err))),
+    };
+    file.seek(std::io::SeekFrom::Start(query.offset))
+        .await
+        .map_err(|err| AppError::from(anyhow!(err)))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .await
+        .map_err(|err| AppError::from(anyhow!(err)))?;
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        bytes,
+    )
+        .into_response())
+}
+
+fn empty_artifact_response() -> Response {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        Vec::new(),
+    )
+        .into_response()
 }
 
 async fn worker_loop(state: AppState, interval: Duration) {
@@ -290,6 +352,21 @@ async fn process_task(
         let session_id = lifecycle
             .start_session(store, &mut task, action_id, &prepared.manifest)
             .await?;
+        let planned = harness_runner.planned_artifacts(&task, &prepared);
+        if !planned.is_empty() {
+            let now = now_ms();
+            for artifact in planned {
+                register_artifact(
+                    &mut task,
+                    artifact.kind,
+                    artifact.path,
+                    artifact_source_session(&session_id),
+                    now,
+                );
+            }
+            task.updated_at_ms = now;
+            store.save(&task).await?;
+        }
         let harness_run = match harness_runner.run(&task, &prepared).await {
             Ok(mut run) => {
                 lifecycle
@@ -1354,6 +1431,11 @@ async fn list_top_level_entries(path: &Path) -> Result<Vec<String>> {
 
 #[async_trait]
 trait AgentHarness: Send + Sync {
+    /// Artifacts this harness will produce during the run, known up front.
+    /// These are registered at session start so observers can stream them
+    /// while the session is still running.
+    fn planned_artifacts(&self, task: &Task, prepared: &PreparedContext) -> Vec<GeneratedArtifact>;
+
     async fn run(&self, task: &Task, prepared: &PreparedContext) -> Result<HarnessRun>;
 }
 
@@ -1369,6 +1451,30 @@ impl LocalAgentHarness {
 
 #[async_trait]
 impl AgentHarness for LocalAgentHarness {
+    fn planned_artifacts(&self, task: &Task, prepared: &PreparedContext) -> Vec<GeneratedArtifact> {
+        match task.spec.harness.kind {
+            HarnessKind::FakeSummary => Vec::new(),
+            HarnessKind::OpencodeAcp => vec![
+                GeneratedArtifact::new(
+                    "opencode-acp-log",
+                    prepared
+                        .artifact_dir
+                        .join("opencode-acp.ndjson")
+                        .display()
+                        .to_string(),
+                ),
+                GeneratedArtifact::new(
+                    "opencode-acp-stderr",
+                    prepared
+                        .artifact_dir
+                        .join("opencode-acp.stderr.log")
+                        .display()
+                        .to_string(),
+                ),
+            ],
+        }
+    }
+
     async fn run(&self, task: &Task, prepared: &PreparedContext) -> Result<HarnessRun> {
         run_harness(task, prepared, self.artifact_store.clone()).await
     }
@@ -1407,7 +1513,6 @@ async fn run_opencode_acp(
 
     let stderr = child.stderr.take().context("missing ACP stderr")?;
     let stderr_path = prepared.artifact_dir.join("opencode-acp.stderr.log");
-    let stderr_artifact_path = stderr_path.clone();
     let stderr_artifact_store = artifact_store.clone();
     tokio::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
@@ -1486,15 +1591,11 @@ async fn run_opencode_acp(
     if summary.trim().is_empty() {
         bail!("opencode ACP completed without agent text");
     }
+    // Protocol/stderr logs are pre-registered via planned_artifacts so they
+    // can be streamed during the run; only run-discovered artifacts go here.
     Ok(HarnessRun {
         summary,
-        artifacts: vec![
-            GeneratedArtifact::new("opencode-acp-log", log_path.display().to_string()),
-            GeneratedArtifact::new(
-                "opencode-acp-stderr",
-                stderr_artifact_path.display().to_string(),
-            ),
-        ],
+        artifacts: Vec::new(),
     })
 }
 

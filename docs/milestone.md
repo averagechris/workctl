@@ -41,10 +41,14 @@ and:
 
 ## Gap list (in order)
 
-1. **Artifact content API.** `GET /tasks/{id}/artifacts/{artifact}/content`
-   with offset support, authz-checked. `task review` fetches diffs through it;
-   `task watch` tails the harness protocol log through it (offset polling
-   replaces local file tailing). Remove the shared-filesystem fallbacks.
+1. ~~**Artifact content API.**~~ — **done.** `GET
+   /tasks/{id}/artifacts/{position}/content?offset=N` serves artifact bytes
+   from an offset (empty body when the file is not written yet). Harness
+   protocol/stderr logs are pre-registered at session start via
+   `AgentHarness::planned_artifacts` so observers can stream them while the
+   session runs. `task watch` tails the log and `task review` fetches diffs
+   exclusively through this endpoint; the CLI no longer reads the daemon's
+   filesystem at all. Authorization checks attach when gaps 2–3 land.
 2. **Token auth.** `Authorization: Bearer` on every request. First
    implementation: static tokens declared in daemon config mapping token ->
    user/org. Requests resolve to a `UserId`/`OrganizationId`; `local` defaults

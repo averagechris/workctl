@@ -51,7 +51,6 @@ fn cli_submits_task_to_workd_loop_with_fake_harness() {
         .output()
         .unwrap();
 
-    kill(&mut workd);
     assert!(
         output.status.success(),
         "stdout={}\nstderr={}",
@@ -185,6 +184,33 @@ fn cli_submits_task_to_workd_loop_with_fake_harness() {
     assert_eq!(manifest["runtime_handle"]["kind"], "local-devshell");
     assert!(Path::new(workspace).join("prompts/task.md").exists());
     assert!(Path::new(workspace).join("artifacts/summary.md").exists());
+
+    // Artifact content is served through the API with offset support.
+    let task_id = task["id"].as_str().unwrap();
+    let artifacts = task["artifacts"].as_array().unwrap();
+    let summary_position = artifacts
+        .iter()
+        .position(|artifact| artifact["kind"] == "summary")
+        .unwrap();
+    let content_url = format!("http://{bind}/tasks/{task_id}/artifacts/{summary_position}/content");
+    let full = reqwest::blocking::get(&content_url).unwrap();
+    assert!(full.status().is_success());
+    let full_body = full.text().unwrap();
+    assert!(full_body.contains("README.md"), "body={full_body}");
+
+    let tail = reqwest::blocking::get(format!("{content_url}?offset=5"))
+        .unwrap()
+        .text()
+        .unwrap();
+    assert_eq!(tail, full_body[5..], "offset read must skip bytes");
+
+    let missing = reqwest::blocking::get(format!(
+        "http://{bind}/tasks/{task_id}/artifacts/999/content"
+    ))
+    .unwrap();
+    assert_eq!(missing.status().as_u16(), 404);
+
+    kill(&mut workd);
 }
 
 #[test]

@@ -189,9 +189,8 @@ the prepared execution context is the safety boundary, not per-tool-call
 approval. After a session completes, the daemon captures each mounted repo's
 working-tree diff (including intent-to-add for new files) as a `repo-diff`
 artifact with session provenance. `workctl task review <id>` renders the
-summary output plus those diffs as the local review surface; it reads diff
-contents from the shared local filesystem, which is a local-milestone
-convenience like watch's log tailing.
+summary output plus those diffs, fetching diff contents through the artifact
+content API like watch does.
 
 `workd` accesses persistence through a `ControlStore` trait. The local
 implementation is SQLite-backed, while worker claims remain an in-memory
@@ -229,12 +228,13 @@ audit, and future projections.
 Live observation in the local slice is `workctl task watch <id>` (or `submit
 --watch`). The CLI polls the task and prints each newly appended task record,
 so state changes, context preparation, sessions, outputs, and artifacts stream
-as they happen; `--json` emits the records as NDJSON. When the opencode-acp
-protocol log is visible on the local filesystem, watch also tails it and
-streams agent message text and tool-call titles between records. Reading the
-workspace log file directly is a local-milestone convenience that works because
-the CLI and daemon share a machine; a remote deployment needs an observation
-endpoint or artifact streaming instead.
+as they happen; `--json` emits the records as NDJSON. Harness protocol and
+stderr logs are pre-registered as artifacts at session start
+(`AgentHarness::planned_artifacts`), and watch tails the protocol log through
+the artifact content API (`GET /tasks/{id}/artifacts/{position}/content` with
+byte offsets), streaming agent message text and tool-call titles between
+records. The CLI never reads the daemon's filesystem, so watch behaves
+identically against local and remote daemons.
 
 The first local identity model assigns submitted tasks to organization `local`
 and user `local`. The user ID is stored on the task row and included in the

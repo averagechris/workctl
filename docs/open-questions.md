@@ -96,9 +96,9 @@ Answer these when they become implementation blockers.
 - Control-plane lifecycle: auto-start local `workd`, configured server, or both?
 - Bootstrap config/state paths: XDG layout, Nix module shape, secrets wiring.
 - Runtime config propagation: how do workers observe config changes?
-- Remote observation transport: `task watch` currently tails the harness log
-  from the shared local filesystem; remote deployments need a server-side
-  event/log streaming mechanism.
+- Streaming transport beyond offset polling: the artifact content API serves
+  byte ranges that watch polls every 500ms; SSE/WebSocket push can replace
+  polling if it proves too chatty.
 
 ## Context and execution
 
