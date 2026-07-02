@@ -414,6 +414,129 @@ fn cli_watch_streams_records_until_terminal_state() {
     );
 }
 
+#[test]
+fn auth_tokens_scope_task_visibility_by_organization() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("source-repo");
+    create_git_repo(&repo);
+
+    let bind = free_addr();
+    let state_dir = temp.path().join("state");
+    let mut workd_command = cargo_run("workd");
+    let mut workd = workd_command
+        .arg("serve")
+        .arg("--bind")
+        .arg(&bind)
+        .arg("--state-dir")
+        .arg(&state_dir)
+        .arg("--worker-interval-ms")
+        .arg("100")
+        .arg("--auth-token")
+        .arg("alice-token:alice:acme")
+        .arg("--auth-token")
+        .arg("bob-token:bob:bobco")
+        .spawn()
+        .unwrap();
+    wait_for_workd(&bind);
+
+    let workctl = |token: Option<&str>, args: &[&str]| {
+        let mut command = cargo_run("workctl");
+        command.arg("--server").arg(format!("http://{bind}"));
+        if let Some(token) = token {
+            command.arg("--token").arg(token);
+        }
+        command.args(args).output().unwrap()
+    };
+
+    // Without a token, requests are rejected (tokens disable anonymous mode).
+    let denied = workctl(None, &["task", "list"]);
+    assert!(!denied.status.success());
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("401"),
+        "stderr={}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+
+    // Alice submits a task in org acme.
+    let submitted = workctl(
+        Some("alice-token"),
+        &[
+            "--json",
+            "submit",
+            "--title",
+            "Auth fixture",
+            "--intent",
+            "Summarize this fixture repository",
+            "--repo",
+            &repo.display().to_string(),
+            "--harness",
+            "fake-summary",
+            "--wait",
+            "--timeout-secs",
+            "30",
+        ],
+    );
+    assert!(
+        submitted.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&submitted.stderr)
+    );
+    let task: Value = serde_json::from_slice(&submitted.stdout).unwrap();
+    assert_eq!(task["state"], "done");
+    assert_eq!(task["user_id"], "alice");
+    assert_eq!(task["organization_id"], "acme");
+    let task_id = task["id"].as_str().unwrap();
+
+    // Alice can read her task; Bob cannot see it at all.
+    let alice_get = workctl(Some("alice-token"), &["--json", "task", "get", task_id]);
+    assert!(alice_get.status.success());
+    let bob_get = workctl(Some("bob-token"), &["--json", "task", "get", task_id]);
+    assert!(!bob_get.status.success());
+    assert!(
+        String::from_utf8_lossy(&bob_get.stderr).contains("404"),
+        "stderr={}",
+        String::from_utf8_lossy(&bob_get.stderr)
+    );
+
+    // Bob's task list is empty; Alice's contains the task.
+    let bob_list = workctl(Some("bob-token"), &["--json", "task", "list"]);
+    assert!(bob_list.status.success());
+    let bob_tasks: Value = serde_json::from_slice(&bob_list.stdout).unwrap();
+    assert_eq!(bob_tasks.as_array().unwrap().len(), 0);
+    let alice_list = workctl(Some("alice-token"), &["--json", "task", "list"]);
+    let alice_tasks: Value = serde_json::from_slice(&alice_list.stdout).unwrap();
+    assert_eq!(alice_tasks.as_array().unwrap().len(), 1);
+
+    // Artifact content honors the same scoping: 401 without a token, 404 for
+    // the wrong org, 200 for the owner.
+    let content_url = format!("http://{bind}/tasks/{task_id}/artifacts/0/content");
+    let http = reqwest::blocking::Client::new();
+    assert_eq!(
+        http.get(&content_url).send().unwrap().status().as_u16(),
+        401
+    );
+    assert_eq!(
+        http.get(&content_url)
+            .bearer_auth("bob-token")
+            .send()
+            .unwrap()
+            .status()
+            .as_u16(),
+        404
+    );
+    assert_eq!(
+        http.get(&content_url)
+            .bearer_auth("alice-token")
+            .send()
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+
+    kill(&mut workd);
+}
+
 fn create_git_repo(path: &Path) {
     std::fs::create_dir_all(path).unwrap();
     std::fs::write(path.join("README.md"), "# Fixture\n").unwrap();

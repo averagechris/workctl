@@ -16,6 +16,13 @@ const DEFAULT_SERVER: &str = "http://127.0.0.1:7878";
 struct Cli {
     #[arg(long, env = "WORKD_URL", global = true, default_value = DEFAULT_SERVER)]
     server: String,
+    /// Bearer token for authenticating with workd.
+    #[arg(long, env = "WORKCTL_TOKEN", global = true)]
+    token: Option<String>,
+    /// Allow plaintext HTTP to non-loopback servers. TLS is expected to be
+    /// terminated by a reverse proxy or ingress in front of workd.
+    #[arg(long, env = "WORKCTL_INSECURE_HTTP", global = true)]
+    insecure_http: bool,
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -111,7 +118,7 @@ impl From<ExecutorArg> for ExecutorKind {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let client = Client::new(cli.server.clone())?;
+    let client = Client::new(cli.server.clone(), cli.token.clone(), cli.insecure_http)?;
     match cli.command {
         Command::Health => {
             let health = client.health().await?;
@@ -603,15 +610,32 @@ fn print_watch_final(json: bool, task: &Task) -> Result<()> {
 
 struct Client {
     base: String,
+    token: Option<String>,
     http: reqwest::Client,
 }
 
 impl Client {
-    fn new(base: String) -> Result<Self> {
+    fn new(base: String, token: Option<String>, insecure_http: bool) -> Result<Self> {
+        let base = base.trim_end_matches('/').to_string();
+        if !insecure_http && plaintext_to_remote(&base) {
+            bail!(
+                "refusing plaintext HTTP to non-loopback server {base}; \
+                 use https:// (TLS terminates at your proxy/ingress) or pass --insecure-http"
+            );
+        }
         Ok(Self {
-            base: base.trim_end_matches('/').to_string(),
+            base,
+            token,
             http: reqwest::Client::builder().build()?,
         })
+    }
+
+    fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
+        let mut request = self.http.request(method, url);
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        request
     }
 
     async fn health(&self) -> Result<HealthResponse> {
@@ -638,11 +662,13 @@ impl Client {
         offset: u64,
     ) -> Result<Vec<u8>> {
         let response = self
-            .http
-            .get(format!(
-                "{}/tasks/{task_id}/artifacts/{position}/content?offset={offset}",
-                self.base
-            ))
+            .request(
+                reqwest::Method::GET,
+                format!(
+                    "{}/tasks/{task_id}/artifacts/{position}/content?offset={offset}",
+                    self.base
+                ),
+            )
             .send()
             .await?;
         let status = response.status();
@@ -656,7 +682,10 @@ impl Client {
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let response = self.http.get(format!("{}{path}", self.base)).send().await?;
+        let response = self
+            .request(reqwest::Method::GET, format!("{}{path}", self.base))
+            .send()
+            .await?;
         decode_response(response).await
     }
 
@@ -666,13 +695,31 @@ impl Client {
         body: &B,
     ) -> Result<T> {
         let response = self
-            .http
-            .post(format!("{}{path}", self.base))
+            .request(reqwest::Method::POST, format!("{}{path}", self.base))
             .json(body)
             .send()
             .await?;
         decode_response(response).await
     }
+}
+
+/// True when the URL uses plaintext HTTP against a non-loopback host.
+fn plaintext_to_remote(base: &str) -> bool {
+    let Some(rest) = base.strip_prefix("http://") else {
+        return false;
+    };
+    let host = rest
+        .split(['/', '?'])
+        .next()
+        .unwrap_or_default()
+        .rsplit_once(':')
+        .map_or_else(
+            || rest.split(['/', '?']).next().unwrap_or_default(),
+            |(host, _port)| host,
+        )
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    !matches!(host, "localhost" | "127.0.0.1" | "::1" | "0.0.0.0")
 }
 
 async fn decode_response<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Result<T> {
@@ -734,6 +781,16 @@ mod tests {
             parse_harness_log_line(line),
             Some(HarnessEvent::ToolCall(title)) if title == "read src/main.rs"
         ));
+    }
+
+    #[test]
+    fn refuses_plaintext_to_remote_hosts() {
+        assert!(plaintext_to_remote("http://workd.example.com"));
+        assert!(plaintext_to_remote("http://10.0.0.5:7878"));
+        assert!(!plaintext_to_remote("http://127.0.0.1:7878"));
+        assert!(!plaintext_to_remote("http://localhost:7878"));
+        assert!(!plaintext_to_remote("http://[::1]:7878"));
+        assert!(!plaintext_to_remote("https://workd.example.com"));
     }
 
     #[test]

@@ -63,6 +63,15 @@ struct ServeArgs {
     worker_interval_ms: u64,
     #[arg(long, env = "WORKD_DISABLE_WORKER")]
     disable_worker: bool,
+    /// Bearer tokens as `token:user:org` triples. Repeat the flag or provide a
+    /// comma-separated list via WORKD_AUTH_TOKENS.
+    #[arg(long = "auth-token", env = "WORKD_AUTH_TOKENS", value_delimiter = ',')]
+    auth_tokens: Vec<String>,
+    /// Explicitly allow unauthenticated requests, which resolve to the local
+    /// user/organization. Implied when no tokens are configured and the bind
+    /// address is loopback.
+    #[arg(long, env = "WORKD_ALLOW_ANONYMOUS")]
+    allow_anonymous: bool,
 }
 
 #[derive(Clone)]
@@ -75,6 +84,106 @@ struct AppState {
     harness_runner: Arc<dyn AgentHarness>,
     action_queue: Arc<dyn ActionQueue>,
     claim_manager: Arc<dyn ClaimManager>,
+    auth: Arc<AuthConfig>,
+}
+
+/// Authenticated request identity: the user and organization a request acts
+/// as. Resolved from a bearer token, or the local defaults when anonymous
+/// access is allowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Identity {
+    user_id: UserId,
+    organization_id: OrganizationId,
+}
+
+impl Identity {
+    fn local() -> Self {
+        Self {
+            user_id: UserId(LOCAL_USER_ID.into()),
+            organization_id: OrganizationId("local".into()),
+        }
+    }
+}
+
+/// Static token table declared in daemon configuration. The first auth
+/// implementation: bearer token -> identity, with an explicit or implied
+/// anonymous-local fallback for single-user loopback use.
+struct AuthConfig {
+    tokens: HashMap<String, Identity>,
+    allow_anonymous: bool,
+}
+
+impl AuthConfig {
+    fn from_serve_args(args: &ServeArgs) -> Result<Self> {
+        let mut tokens = HashMap::new();
+        for entry in &args.auth_tokens {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let mut parts = entry.splitn(3, ':');
+            let (Some(token), Some(user), Some(org)) = (parts.next(), parts.next(), parts.next())
+            else {
+                bail!("invalid --auth-token entry (expected token:user:org)");
+            };
+            if token.is_empty() || user.is_empty() || org.is_empty() {
+                bail!("invalid --auth-token entry (empty token, user, or org)");
+            }
+            if tokens
+                .insert(
+                    token.to_string(),
+                    Identity {
+                        user_id: UserId(user.to_string()),
+                        organization_id: OrganizationId(org.to_string()),
+                    },
+                )
+                .is_some()
+            {
+                bail!("duplicate --auth-token value");
+            }
+        }
+        let allow_anonymous =
+            args.allow_anonymous || (tokens.is_empty() && args.bind.ip().is_loopback());
+        if tokens.is_empty() && !allow_anonymous {
+            bail!(
+                "refusing to serve a non-loopback bind without auth tokens; \
+                 configure --auth-token or pass --allow-anonymous explicitly"
+            );
+        }
+        Ok(Self {
+            tokens,
+            allow_anonymous,
+        })
+    }
+
+    fn resolve(&self, bearer_token: Option<&str>) -> std::result::Result<Identity, AppError> {
+        match bearer_token {
+            Some(token) => self
+                .tokens
+                .get(token)
+                .cloned()
+                .ok_or_else(|| AppError::unauthorized("invalid bearer token")),
+            None if self.allow_anonymous => Ok(Identity::local()),
+            None => Err(AppError::unauthorized("missing bearer token")),
+        }
+    }
+}
+
+impl axum::extract::FromRequestParts<AppState> for Identity {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        let bearer = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::trim);
+        state.auth.resolve(bearer)
+    }
 }
 
 #[tokio::main]
@@ -91,6 +200,10 @@ async fn main() -> Result<()> {
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
+    let auth = Arc::new(AuthConfig::from_serve_args(&args)?);
+    if auth.allow_anonymous {
+        info!("anonymous requests are enabled and resolve to the local user");
+    }
     let state_dir = args.state_dir.unwrap_or_else(default_state_dir);
     fs::create_dir_all(&state_dir).await?;
     let store: Arc<dyn ControlStore> = Arc::new(SqliteStore::new(state_dir).await?);
@@ -110,6 +223,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         harness_runner: Arc::new(LocalAgentHarness::new(artifact_store.clone())),
         action_queue: Arc::new(LocalCreatedTaskQueue),
         claim_manager: Arc::new(InMemoryClaimManager::default()),
+        auth,
     };
 
     if !args.disable_worker {
@@ -144,9 +258,13 @@ async fn health() -> Json<HealthResponse> {
 
 async fn submit_task(
     State(state): State<AppState>,
+    identity: Identity,
     Json(request): Json<SubmitTaskRequest>,
 ) -> Result<Json<SubmitTaskResponse>, AppError> {
-    let decision = state.policy.evaluate_submission(&request).await?;
+    let decision = state
+        .policy
+        .evaluate_submission(&identity, &request)
+        .await?;
 
     let now = now_ms();
     let title = request.title;
@@ -195,18 +313,45 @@ async fn submit_task(
 
 async fn get_task(
     State(state): State<AppState>,
+    identity: Identity,
     AxumPath(task_id): AxumPath<String>,
 ) -> Result<Json<Task>, AppError> {
-    state
-        .store
-        .load(&TaskId(task_id.clone()))
-        .await?
+    load_visible_task(&state, &identity, &task_id)
+        .await
         .map(Json)
-        .ok_or_else(|| AppError::not_found(format!("task {task_id}")))
 }
 
-async fn list_tasks(State(state): State<AppState>) -> Result<Json<Vec<Task>>, AppError> {
-    Ok(Json(state.store.list().await?))
+/// Load a task and enforce visibility for the authenticated identity.
+/// Invisible tasks are indistinguishable from missing ones (404), avoiding
+/// existence leaks across organizations.
+async fn load_visible_task(
+    state: &AppState,
+    identity: &Identity,
+    task_id: &str,
+) -> Result<Task, AppError> {
+    let task = state
+        .store
+        .load(&TaskId(task_id.to_string()))
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("task {task_id}")))?;
+    if !state.policy.task_visible(identity, &task) {
+        return Err(AppError::not_found(format!("task {task_id}")));
+    }
+    Ok(task)
+}
+
+async fn list_tasks(
+    State(state): State<AppState>,
+    identity: Identity,
+) -> Result<Json<Vec<Task>>, AppError> {
+    let tasks = state
+        .store
+        .list()
+        .await?
+        .into_iter()
+        .filter(|task| state.policy.task_visible(&identity, task))
+        .collect();
+    Ok(Json(tasks))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -221,14 +366,11 @@ struct ArtifactContentQuery {
 /// workspace filesystem; clients only ever see this endpoint.
 async fn artifact_content(
     State(state): State<AppState>,
+    identity: Identity,
     AxumPath((task_id, position)): AxumPath<(String, usize)>,
     axum::extract::Query(query): axum::extract::Query<ArtifactContentQuery>,
 ) -> Result<Response, AppError> {
-    let task = state
-        .store
-        .load(&TaskId(task_id.clone()))
-        .await?
-        .ok_or_else(|| AppError::not_found(format!("task {task_id}")))?;
+    let task = load_visible_task(&state, &identity, &task_id).await?;
     let artifact = task
         .artifacts
         .get(position)
@@ -967,8 +1109,14 @@ fn record_context_prepared(
 trait PolicyEngine: Send + Sync {
     async fn evaluate_submission(
         &self,
+        identity: &Identity,
         request: &SubmitTaskRequest,
     ) -> std::result::Result<SubmissionDecision, AppError>;
+
+    /// Whether the authenticated identity may see and act on a task. The
+    /// first rule is organization scoping: members of an organization see its
+    /// tasks. Roles and finer-grained rules attach here later.
+    fn task_visible(&self, identity: &Identity, task: &Task) -> bool;
 }
 
 struct SubmissionDecision {
@@ -982,6 +1130,7 @@ struct LocalPolicyEngine;
 impl PolicyEngine for LocalPolicyEngine {
     async fn evaluate_submission(
         &self,
+        identity: &Identity,
         request: &SubmitTaskRequest,
     ) -> std::result::Result<SubmissionDecision, AppError> {
         if request.title.trim().is_empty() {
@@ -995,9 +1144,13 @@ impl PolicyEngine for LocalPolicyEngine {
         }
 
         Ok(SubmissionDecision {
-            organization_id: OrganizationId("local".into()),
-            user_id: UserId(LOCAL_USER_ID.into()),
+            organization_id: identity.organization_id.clone(),
+            user_id: identity.user_id.clone(),
         })
+    }
+
+    fn task_visible(&self, identity: &Identity, task: &Task) -> bool {
+        task.organization_id == identity.organization_id
     }
 }
 
@@ -2135,6 +2288,13 @@ impl AppError {
             message: message.into(),
         }
     }
+
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<anyhow::Error> for AppError {
@@ -2329,6 +2489,123 @@ mod tests {
         });
         let response = callback_response(&no_options);
         assert_eq!(response["result"]["outcome"]["outcome"], "cancelled");
+    }
+
+    #[test]
+    fn auth_config_parses_tokens_and_resolves_identities() {
+        let args = ServeArgs {
+            bind: "0.0.0.0:7878".parse().unwrap(),
+            state_dir: None,
+            worker_interval_ms: 500,
+            disable_worker: false,
+            auth_tokens: vec!["alpha:alice:acme".into(), "beta:bob:bobco".into()],
+            allow_anonymous: false,
+        };
+        let auth = AuthConfig::from_serve_args(&args).unwrap();
+        let alice = auth.resolve(Some("alpha")).unwrap();
+        assert_eq!(alice.user_id.0, "alice");
+        assert_eq!(alice.organization_id.0, "acme");
+        assert!(auth.resolve(Some("wrong")).is_err());
+        assert!(auth.resolve(None).is_err());
+    }
+
+    #[test]
+    fn anonymous_is_implied_only_for_loopback_without_tokens() {
+        let loopback = ServeArgs {
+            bind: "127.0.0.1:7878".parse().unwrap(),
+            state_dir: None,
+            worker_interval_ms: 500,
+            disable_worker: false,
+            auth_tokens: Vec::new(),
+            allow_anonymous: false,
+        };
+        let auth = AuthConfig::from_serve_args(&loopback).unwrap();
+        assert_eq!(auth.resolve(None).unwrap(), Identity::local());
+
+        let public = ServeArgs {
+            bind: "0.0.0.0:7878".parse().unwrap(),
+            ..loopback.clone()
+        };
+        assert!(AuthConfig::from_serve_args(&public).is_err());
+
+        let public_explicit = ServeArgs {
+            allow_anonymous: true,
+            ..public
+        };
+        let auth = AuthConfig::from_serve_args(&public_explicit).unwrap();
+        assert_eq!(auth.resolve(None).unwrap(), Identity::local());
+    }
+
+    #[test]
+    fn tokens_disable_anonymous_even_on_loopback() {
+        let args = ServeArgs {
+            bind: "127.0.0.1:7878".parse().unwrap(),
+            state_dir: None,
+            worker_interval_ms: 500,
+            disable_worker: false,
+            auth_tokens: vec!["alpha:alice:acme".into()],
+            allow_anonymous: false,
+        };
+        let auth = AuthConfig::from_serve_args(&args).unwrap();
+        assert!(auth.resolve(None).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_token_entries() {
+        let base = ServeArgs {
+            bind: "127.0.0.1:7878".parse().unwrap(),
+            state_dir: None,
+            worker_interval_ms: 500,
+            disable_worker: false,
+            auth_tokens: vec!["missing-parts".into()],
+            allow_anonymous: false,
+        };
+        assert!(AuthConfig::from_serve_args(&base).is_err());
+        let empty_part = ServeArgs {
+            auth_tokens: vec!["token::org".into()],
+            ..base.clone()
+        };
+        assert!(AuthConfig::from_serve_args(&empty_part).is_err());
+        let duplicate = ServeArgs {
+            auth_tokens: vec!["t:alice:acme".into(), "t:bob:bobco".into()],
+            ..base
+        };
+        assert!(AuthConfig::from_serve_args(&duplicate).is_err());
+    }
+
+    #[test]
+    fn task_visibility_is_organization_scoped() {
+        let task = Task {
+            id: TaskId("task_test".into()),
+            organization_id: OrganizationId("acme".into()),
+            user_id: UserId("alice".into()),
+            state: TaskState::Created,
+            title: "t".into(),
+            intent: "i".into(),
+            spec: TaskSpec {
+                repos: vec![],
+                harness: workctl_core::HarnessSpec::default(),
+                executor: workctl_core::ExecutorSpec::default(),
+            },
+            workspace_path: None,
+            summary: None,
+            artifacts: Vec::new(),
+            outputs: Vec::new(),
+            records: Vec::new(),
+            last_error: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let same_org = Identity {
+            user_id: UserId("carol".into()),
+            organization_id: OrganizationId("acme".into()),
+        };
+        let other_org = Identity {
+            user_id: UserId("alice".into()),
+            organization_id: OrganizationId("bobco".into()),
+        };
+        assert!(LocalPolicyEngine.task_visible(&same_org, &task));
+        assert!(!LocalPolicyEngine.task_visible(&other_org, &task));
     }
 
     #[tokio::test]
