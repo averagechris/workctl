@@ -332,6 +332,16 @@ fn cli_watch_streams_records_until_terminal_state() {
         .output()
         .unwrap();
 
+    let mut review_command = cargo_run("workctl");
+    let review_output = review_command
+        .arg("--server")
+        .arg(format!("http://{bind}"))
+        .arg("task")
+        .arg("review")
+        .arg(task_id)
+        .output()
+        .unwrap();
+
     kill(&mut workd);
     assert!(
         watch_output.status.success(),
@@ -356,6 +366,26 @@ fn cli_watch_streams_records_until_terminal_state() {
         "stdout={stdout}"
     );
     assert!(stdout.contains("README.md"), "stdout={stdout}");
+
+    assert!(
+        review_output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&review_output.stdout),
+        String::from_utf8_lossy(&review_output.stderr)
+    );
+    let review_stdout = String::from_utf8_lossy(&review_output.stdout);
+    assert!(
+        review_stdout.contains("## Summary"),
+        "stdout={review_stdout}"
+    );
+    assert!(
+        review_stdout.contains("README.md"),
+        "stdout={review_stdout}"
+    );
+    assert!(
+        review_stdout.contains("no repo diffs were captured"),
+        "stdout={review_stdout}"
+    );
 }
 
 fn create_git_repo(path: &Path) {

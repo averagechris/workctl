@@ -181,6 +181,18 @@ replacement are task submission through `workd`, explicit context preparation,
 executor/harness separation, durable outputs, replayable task records, and
 artifact-backed large data.
 
+Generated prompts are intent-driven: they carry the task title and intent,
+describe the prepared workspace and mounted repos, and permit direct
+working-tree changes when the intent asks for them. The ACP permission
+callback grants an allow option when the agent requests tool permissions —
+the prepared execution context is the safety boundary, not per-tool-call
+approval. After a session completes, the daemon captures each mounted repo's
+working-tree diff (including intent-to-add for new files) as a `repo-diff`
+artifact with session provenance. `workctl task review <id>` renders the
+summary output plus those diffs as the local review surface; it reads diff
+contents from the shared local filesystem, which is a local-milestone
+convenience like watch's log tailing.
+
 `workd` accesses persistence through a `ControlStore` trait. The local
 implementation is SQLite-backed, while worker claims remain an in-memory
 single-daemon mechanism until leases/actions become durable store records.

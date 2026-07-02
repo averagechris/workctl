@@ -26,25 +26,42 @@ workctl task review <task-id>    # summary + workspace diff, usable as a review 
 2. ~~Dogfood run~~ — **done (first pass, 2026-07-01).** Submitted a real
    opencode-acp task against this repo; full loop completed in ~124s with live
    watch output. Findings below.
-3. `workctl task review <id>` — show the summary output plus the diff of each
-   mounted repo in the task workspace.
+3. ~~`workctl task review <id>`~~ — **done.** Shows the summary output plus
+   captured `repo-diff` artifacts. Sessions now capture per-repo working-tree
+   diffs (including new files) as artifacts after the harness runs. Diff
+   contents are read from the local filesystem; remote artifact retrieval is a
+   later transport question.
 4. Fix what the dogfood run surfaces. Repeat until the definition of done holds.
 
 ## Dogfood findings (2026-07-01)
 
-1. **Blocker: generated prompts hardcode a summarize-only task.**
-   `render_prompt` in `workd` appends "Summarize the checked-out repository...
-   Do not modify files." to every prompt regardless of intent. workctl cannot
-   currently delegate a task that *changes code* — the core product promise.
-   The prompt should be driven by the submitted intent, with the summarize
-   framing reserved for summary-style tasks (or dropped entirely).
+Round 2 (same day): submitted "Show tool-call targets in watch output" against
+this repo with opencode-acp. The agent edited `crates/workctl/src/main.rs`,
+the session captured a `repo-diff` artifact, `task review` rendered the diff,
+and the patch was applied to the real repo. **The definition of done has been
+exercised end to end.** Remaining polish items below.
+
+1. ~~**Blocker: generated prompts hardcode a summarize-only task.**~~ —
+   **fixed.** Prompts are now intent-driven: they describe the workspace and
+   mounted repos, permit direct working-tree changes when the task asks for
+   them, and reserve read-only behavior for analysis-style intents. In the
+   same pass, the ACP permission callback now selects an allow option instead
+   of cancelling every request — the execution context is the safety boundary,
+   not per-tool-call approval — so agents can actually edit files.
 2. Watch UX: the final `print_task` summary reprints text that already
    streamed live, duplicating output at the end of a watched run. Minor;
    consider suppressing the summary when it was already streamed.
-3. Observation quality: tool calls stream as bare titles (`tool: read`).
-   Including the target (file path) would make watching materially better.
-4. The loop itself held up: records, artifacts, session provenance, and live
-   streaming all behaved as designed on a real repo with the real harness.
+3. ~~Observation quality: tool calls stream as bare titles.~~ — **fixed by a
+   delegated task.** The round-2 agent added location paths to tool-call
+   labels; its diff was reviewed via `task review` and applied. Review caught
+   a real defect (a sed-mangled raw string terminator), validating the
+   human-review step.
+4. The loop itself held up: records, artifacts, session provenance, live
+   streaming, diff capture, and review all behaved as designed on real tasks.
+5. New (round 2): the agent's `edit` tool appeared to fail inside the
+   prepared workspace and it fell back to `bash`+`sed`, which introduced the
+   syntax error. Investigate why opencode's edit tool misbehaves under the
+   redirected HOME/XDG environment.
 
 ## Working rules until this milestone is done
 

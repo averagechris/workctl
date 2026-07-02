@@ -291,10 +291,12 @@ async fn process_task(
             .start_session(store, &mut task, action_id, &prepared.manifest)
             .await?;
         let harness_run = match harness_runner.run(&task, &prepared).await {
-            Ok(run) => {
+            Ok(mut run) => {
                 lifecycle
                     .complete_session(store, &mut task, &session_id, &run)
                     .await?;
+                run.artifacts
+                    .extend(capture_repo_diffs(&prepared, artifact_store).await);
                 run
             }
             Err(err) => {
@@ -1172,6 +1174,55 @@ async fn prepare_context(
     })
 }
 
+/// Capture working-tree diffs from each prepared repo as reviewable
+/// artifacts. Diff capture must never fail the task: failures are logged and
+/// skipped so a completed session still lands with its summary.
+async fn capture_repo_diffs(
+    prepared: &PreparedContext,
+    artifact_store: &dyn ArtifactStore,
+) -> Vec<GeneratedArtifact> {
+    let mut artifacts = Vec::new();
+    for repo in &prepared.manifest.repos {
+        let repo_path = Path::new(&repo.path);
+        // Track untracked files with intent-to-add so new files show in the diff.
+        let mut track = Command::new("git");
+        track.arg("add").arg("-N").arg(".").current_dir(repo_path);
+        if let Err(err) = run_command(&mut track).await {
+            warn!(repo = %repo.name, ?err, "failed to track new files for diff capture");
+            continue;
+        }
+        let diff_output = match Command::new("git")
+            .arg("diff")
+            .current_dir(repo_path)
+            .output()
+            .await
+        {
+            Ok(output) if output.status.success() => output.stdout,
+            Ok(output) => {
+                warn!(repo = %repo.name, status = %output.status, "git diff failed during diff capture");
+                continue;
+            }
+            Err(err) => {
+                warn!(repo = %repo.name, ?err, "failed to run git diff for diff capture");
+                continue;
+            }
+        };
+        if diff_output.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let diff_path = prepared.artifact_dir.join(format!("{}.diff", repo.name));
+        if let Err(err) = artifact_store.write_bytes(&diff_path, &diff_output).await {
+            warn!(repo = %repo.name, ?err, "failed to write repo diff artifact");
+            continue;
+        }
+        artifacts.push(GeneratedArtifact::new(
+            "repo-diff",
+            diff_path.display().to_string(),
+        ));
+    }
+    artifacts
+}
+
 async fn clone_repo(repo: &RepoSpec, destination: &Path) -> Result<()> {
     if fs::try_exists(destination).await? {
         return Ok(());
@@ -1210,8 +1261,15 @@ async fn run_command(command: &mut Command) -> Result<()> {
 }
 
 fn render_prompt(task: &Task) -> String {
+    let repos = task
+        .spec
+        .repos
+        .iter()
+        .map(|repo| format!("- `{}` cloned at `repos/{}`", repo.url, repo.name))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
-        "# Task: {title}\n\n{intent}\n\nSummarize the checked-out repository. Include purpose, structure, important commands, dependencies, and notable implementation details. Do not modify files.\n",
+        "# Task: {title}\n\n{intent}\n\n## Working context\n\nYou are running inside a prepared workctl task workspace. These repositories are checked out for this task:\n{repos}\n\nYour working directory is the primary repository checkout. If the task asks for code or file changes, make them directly in the working tree; changed files are collected as diffs and reviewed after the session. If the task only asks for analysis or a summary, do not modify files.\n\nWhen you are finished, end with a concise summary of what you did and why.\n",
         title = task.title,
         intent = task.intent
     )
@@ -1575,12 +1633,31 @@ fn callback_response(message: &Value) -> Value {
         .unwrap_or_default()
     {
         "session/request_permission" => {
-            json!({"jsonrpc":"2.0", "id": id, "result": {"outcome": {"outcome": "cancelled"}}})
+            // The safety boundary is the prepared execution context, not
+            // per-tool-call approval: grant an allow option when one exists.
+            if let Some(option_id) = choose_permission_option(message.pointer("/params/options")) {
+                json!({"jsonrpc":"2.0", "id": id, "result": {"outcome": {"outcome": "selected", "optionId": option_id}}})
+            } else {
+                json!({"jsonrpc":"2.0", "id": id, "result": {"outcome": {"outcome": "cancelled"}}})
+            }
         }
         _ => {
             json!({"jsonrpc":"2.0", "id": id, "error": {"code": -32601, "message": "workctl ACP client does not implement this method"}})
         }
     }
+}
+
+fn choose_permission_option(options: Option<&Value>) -> Option<String> {
+    let options = options?.as_array()?;
+    let by_kind = |kind: &str| {
+        options
+            .iter()
+            .find(|option| option.get("kind").and_then(Value::as_str) == Some(kind))
+    };
+    by_kind("allow_once")
+        .or_else(|| by_kind("allow_always"))
+        .and_then(|option| option.get("optionId").and_then(Value::as_str))
+        .map(ToString::to_string)
 }
 
 fn is_agent_text_chunk(message: &Value) -> bool {
@@ -2055,5 +2132,195 @@ mod tests {
 
         let summary = fake_summary(&task, &prepared).await.unwrap();
         assert!(summary.contains("README.md"));
+    }
+
+    #[test]
+    fn rendered_prompts_are_intent_driven_and_allow_changes() {
+        let mut task = Task {
+            id: TaskId("task_test".into()),
+            organization_id: OrganizationId("local".into()),
+            user_id: UserId(LOCAL_USER_ID.into()),
+            state: TaskState::Created,
+            title: "Fix the bug".into(),
+            intent: "Fix the off-by-one error in the pager".into(),
+            spec: TaskSpec {
+                repos: vec![RepoSpec {
+                    url: "https://example.com/pager.git".into(),
+                    name: "pager".into(),
+                    checkout: None,
+                }],
+                harness: workctl_core::HarnessSpec {
+                    kind: HarnessKind::OpencodeAcp,
+                },
+                executor: workctl_core::ExecutorSpec::default(),
+            },
+            workspace_path: None,
+            summary: None,
+            artifacts: Vec::new(),
+            outputs: Vec::new(),
+            records: Vec::new(),
+            last_error: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+
+        let prompt = render_prompt(&task);
+        assert!(prompt.contains("Fix the off-by-one error in the pager"));
+        assert!(prompt.contains("`repos/pager`"));
+        assert!(prompt.contains("make them directly in the working tree"));
+        assert!(!prompt.contains("Summarize the checked-out repository"));
+
+        task.title = "Second repo".into();
+        task.spec.repos.push(RepoSpec {
+            url: "https://example.com/docs.git".into(),
+            name: "docs".into(),
+            checkout: None,
+        });
+        assert!(render_prompt(&task).contains("`repos/docs`"));
+    }
+
+    #[test]
+    fn permission_requests_prefer_allow_options() {
+        let options = json!([
+            {"optionId": "reject", "name": "Reject", "kind": "reject_once"},
+            {"optionId": "always", "name": "Always allow", "kind": "allow_always"},
+            {"optionId": "once", "name": "Allow", "kind": "allow_once"},
+        ]);
+        assert_eq!(
+            choose_permission_option(Some(&options)),
+            Some("once".to_string())
+        );
+
+        let always_only = json!([
+            {"optionId": "always", "name": "Always allow", "kind": "allow_always"},
+        ]);
+        assert_eq!(
+            choose_permission_option(Some(&always_only)),
+            Some("always".to_string())
+        );
+
+        let reject_only = json!([
+            {"optionId": "reject", "name": "Reject", "kind": "reject_once"},
+        ]);
+        assert_eq!(choose_permission_option(Some(&reject_only)), None);
+        assert_eq!(choose_permission_option(None), None);
+    }
+
+    #[test]
+    fn permission_callback_selects_allow_option() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "session/request_permission",
+            "params": {"options": [
+                {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+            ]},
+        });
+        let response = callback_response(&request);
+        assert_eq!(response["result"]["outcome"]["outcome"], "selected");
+        assert_eq!(response["result"]["outcome"]["optionId"], "allow");
+
+        let no_options = json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "session/request_permission",
+            "params": {},
+        });
+        let response = callback_response(&no_options);
+        assert_eq!(response["result"]["outcome"]["outcome"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn captures_working_tree_diffs_as_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let artifact_dir = temp.path().join("artifacts");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("lib.rs"), "fn old() {}\n").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "init",
+        ]);
+
+        // Simulate agent work: modify a tracked file and add a new one.
+        std::fs::write(repo.join("lib.rs"), "fn new_name() {}\n").unwrap();
+        std::fs::write(repo.join("added.rs"), "fn added() {}\n").unwrap();
+
+        let prepared = PreparedContext {
+            primary_repo: repo.clone(),
+            artifact_dir: artifact_dir.clone(),
+            prompt_path: temp.path().join("prompt.md"),
+            manifest: ContextManifest {
+                context_id: ExecutionContextId("ctx_test".into()),
+                task_id: TaskId("task_test".into()),
+                node_id: NodeId(LOCAL_NODE_ID.into()),
+                executor: workctl_core::ExecutorKind::LocalDevshell,
+                harness: HarnessKind::FakeSummary,
+                runtime_handle: RuntimeHandle {
+                    kind: "local-devshell".into(),
+                    id: temp.path().display().to_string(),
+                },
+                workspace_path: temp.path().display().to_string(),
+                repos: vec![PreparedRepo {
+                    name: "repo".into(),
+                    url: "https://example.com/repo.git".into(),
+                    path: repo.display().to_string(),
+                    checkout: None,
+                }],
+                artifact_dir: artifact_dir.display().to_string(),
+                prompt_path: temp.path().join("prompt.md").display().to_string(),
+                devshell: DevshellManifest {
+                    mode: DevshellMode::DirectProcess,
+                    command: vec!["fake-summary".into()],
+                },
+            },
+        };
+
+        let artifacts = capture_repo_diffs(&prepared, &LocalArtifactStore).await;
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].kind, "repo-diff");
+        let diff = std::fs::read_to_string(&artifacts[0].path).unwrap();
+        assert!(diff.contains("new_name"), "diff={diff}");
+        assert!(diff.contains("added.rs"), "diff={diff}");
+
+        // A clean repo produces no diff artifact.
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "agent work",
+        ]);
+        assert!(
+            capture_repo_diffs(&prepared, &LocalArtifactStore)
+                .await
+                .is_empty()
+        );
     }
 }

@@ -46,6 +46,9 @@ enum TaskCommand {
         #[arg(long, default_value_t = 1800)]
         timeout_secs: u64,
     },
+    Review {
+        task_id: String,
+    },
     Outputs {
         task_id: String,
     },
@@ -153,6 +156,12 @@ async fn main() -> Result<()> {
         } => {
             let task = watch_task(&client, cli.json, &task_id, timeout_secs).await?;
             print_watch_final(cli.json, &task)?;
+        }
+        Command::Task {
+            command: TaskCommand::Review { task_id },
+        } => {
+            let task = client.get(&task_id).await?;
+            review_task(cli.json, &task).await?;
         }
         Command::Task {
             command: TaskCommand::Get { task_id },
@@ -505,7 +514,15 @@ fn parse_harness_log_line(line: &str) -> Option<HarnessEvent> {
                 .and_then(Value::as_str)
                 .or_else(|| update.get("kind").and_then(Value::as_str))
                 .unwrap_or("unnamed tool call");
-            Some(HarnessEvent::ToolCall(title.to_string()))
+            let location = update
+                .pointer("/locations/0/path")
+                .and_then(Value::as_str)
+                .filter(|p| !p.is_empty());
+            let label = match location {
+                Some(path) => format!("{title} {path}"),
+                None => title.to_string(),
+            };
+            Some(HarnessEvent::ToolCall(label))
         }
         _ => None,
     }
@@ -514,6 +531,51 @@ fn parse_harness_log_line(line: &str) -> Option<HarnessEvent> {
 fn print_value<T: serde::Serialize>(json: bool, value: &T) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(value)?);
+    }
+    Ok(())
+}
+
+/// Review surface for a finished task: the summary output plus any captured
+/// repo diffs. Diff contents are read from the local filesystem, which works
+/// for the local single-machine milestone; remote deployments will need
+/// artifact retrieval through the control plane.
+async fn review_task(json: bool, task: &Task) -> Result<()> {
+    let mut diffs = Vec::new();
+    for artifact in &task.artifacts {
+        if artifact.kind != "repo-diff" {
+            continue;
+        }
+        let content = tokio::fs::read_to_string(&artifact.path).await.ok();
+        diffs.push((artifact.path.clone(), content));
+    }
+
+    if json {
+        let value = serde_json::json!({
+            "task": task,
+            "diffs": diffs
+                .iter()
+                .map(|(path, content)| serde_json::json!({"path": path, "content": content}))
+                .collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+
+    println!("task {} {}", task.id, task.state);
+    if let Some(summary) = &task.summary {
+        println!("\n## Summary\n\n{summary}");
+    }
+    if let Some(error) = &task.last_error {
+        println!("\n## Error\n\n{error}");
+    }
+    if diffs.is_empty() {
+        println!("\n(no repo diffs were captured for this task)");
+    }
+    for (path, content) in &diffs {
+        match content {
+            Some(diff) => println!("\n## Diff: {path}\n\n{diff}"),
+            None => println!("\n## Diff: {path}\n\n(not readable from this machine)"),
+        }
     }
     Ok(())
 }
@@ -644,6 +706,15 @@ mod tests {
         let client = r#"client {"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#;
         assert!(parse_harness_log_line(client).is_none());
         assert!(parse_harness_log_line("not json").is_none());
+    }
+
+    #[test]
+    fn parses_tool_call_with_location_path() {
+        let line = r#"agent {"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","title":"read","locations":[{"path":"src/main.rs"}]}}}"#;
+        assert!(matches!(
+            parse_harness_log_line(line),
+            Some(HarnessEvent::ToolCall(title)) if title == "read src/main.rs"
+        ));
     }
 
     #[test]
