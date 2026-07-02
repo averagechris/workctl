@@ -87,8 +87,11 @@ Answer these when they become implementation blockers.
 
 ## Core implementation
 
-- CLI-to-`workd` protocol: Unix socket, HTTPS, JSON-RPC, gRPC, SSH tunnel?
-- Auth mechanism beyond the local default user: tokens, mTLS, SSO, SSH tunnel?
+- CLI-to-`workd` protocol: **being decided in Milestone 2** — keep HTTP+JSON,
+  bearer tokens, TLS via proxy/ingress. Revisit gRPC/other transports only if
+  the JSON API becomes a real limitation.
+- Auth mechanism beyond the local default user: **being decided in Milestone
+  2** — static config-declared tokens first; SSO/mTLS/issued tokens later.
 - Role model: org admins, members, service accounts, workers.
 - Control-plane lifecycle: auto-start local `workd`, configured server, or both?
 - Bootstrap config/state paths: XDG layout, Nix module shape, secrets wiring.

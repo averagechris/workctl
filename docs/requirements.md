@@ -11,6 +11,12 @@ This document states baseline requirements and decisions.
 - Workers pull actions and report observations/artifacts. Servers should not need
   to SSH into workers.
 - The control plane can run locally or remotely.
+- `workd` must stay deployable in two styles with no lock-in, from the same
+  flake: a NixOS module (systemd service) for personal servers, and an OCI
+  image (ECR/helm-friendly) for Kubernetes deployments. Configuration works
+  through files plus environment variables so both styles are ergonomic.
+- TLS is terminated in front of `workd` (reverse proxy or ingress); clients
+  refuse plaintext for non-loopback servers unless explicitly overridden.
 - Multi-user and tenant/organization support are built in from the start.
 - Single-node personal use is the simple case: one user, one organization, local
   auth defaults.

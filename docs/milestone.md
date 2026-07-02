@@ -1,85 +1,91 @@
-# Current milestone
+# Milestones
 
-## Milestone 1: dogfood a real delegated task
+## Roadmap
 
-**Definition of done:** submit a real coding task against a real repo through
-`workctl` with the `opencode-acp` harness, watch it work live, review the
-result, and use the output — without reading daemon logs or spelunking the
-workspace directory by hand.
+1. **Milestone 1: dogfood a real delegated task** — done (2026-07-01). See
+   `milestone-1-dogfood.md` for the record.
+2. **Milestone 2: remote control plane** — current. Defined below.
+3. **Milestone 3: isolated execution** — a second `ExecutorBackend` giving
+   each task an isolated runtime. Decided in `adr/0001-executor-isolation.md`:
+   OCI containers are the task runtime contract (`container` backend first,
+   `k8s-job` second, VM-grade isolation via runtime selection where KVM
+   exists).
+4. **Milestone 4: Linear integration** — project task outputs to Linear
+   comments, then react to Linear comments by creating tasks. Reaction to
+   external triggers stays parked until isolation exists, because it means
+   externally-initiated code execution.
 
-Concretely, this session must be possible:
+Later milestones (unordered): claim/resume for humans, durable leases and
+action queues, cleanup gates, additional integrations.
+
+## Milestone 2: remote control plane
+
+**Definition of done:** `workd` runs on a server. From a laptop with no shared
+filesystem, this session works over the network with a token:
 
 ```text
-workctl submit --title "..." --intent "..." --repo <real repo> --harness opencode-acp
-workctl task watch <task-id>     # live progress: state changes, session events, harness output
-workctl task review <task-id>    # summary + workspace diff, usable as a review surface
+workctl --server https://workd.example task submit ... --watch   # streams remotely
+workctl task review <task-id>                                    # diffs fetched via API
+workctl task list                                                # only tasks the token may see
 ```
+
+and:
+
+- A request without a valid token is rejected (401).
+- A token scoped to one user cannot read another user's tasks (403/404).
+- Watch streams records *and* harness output without reading the daemon's
+  filesystem; review fetches diff content the same way.
+- The same flake produces both a NixOS module (personal server) and an OCI
+  image that runs unmodified under Kubernetes/helm (work). No lock-in to
+  either deployment style.
 
 ## Gap list (in order)
 
-1. ~~`workctl task watch <id>`~~ — **done.** `task watch` (and `submit
-   --watch`) polls the task and streams new records live; when the harness
-   protocol log is visible on the local filesystem it also streams agent text
-   and tool calls. `--json` emits records as NDJSON. Tailing the log file
-   directly is a local-milestone convenience, not the final observation
-   transport.
-2. ~~Dogfood run~~ — **done (first pass, 2026-07-01).** Submitted a real
-   opencode-acp task against this repo; full loop completed in ~124s with live
-   watch output. Findings below.
-3. ~~`workctl task review <id>`~~ — **done.** Shows the summary output plus
-   captured `repo-diff` artifacts. Sessions now capture per-repo working-tree
-   diffs (including new files) as artifacts after the harness runs. Diff
-   contents are read from the local filesystem; remote artifact retrieval is a
-   later transport question.
-4. Fix what the dogfood run surfaces. Repeat until the definition of done holds.
+1. **Artifact content API.** `GET /tasks/{id}/artifacts/{artifact}/content`
+   with offset support, authz-checked. `task review` fetches diffs through it;
+   `task watch` tails the harness protocol log through it (offset polling
+   replaces local file tailing). Remove the shared-filesystem fallbacks.
+2. **Token auth.** `Authorization: Bearer` on every request. First
+   implementation: static tokens declared in daemon config mapping token ->
+   user/org. Requests resolve to a `UserId`/`OrganizationId`; `local` defaults
+   remain only for a dev-mode flag. This makes the existing `user_id` fields
+   real.
+3. **Authorization.** Task visibility scoped by organization/user through the
+   existing `PolicyEngine` seam. List/get/artifact endpoints filter by the
+   authenticated identity.
+4. **TLS/transport stance.** Keep the HTTP+JSON API. Document that TLS is
+   terminated by a reverse proxy (NixOS) or ingress (k8s); `workctl` refuses
+   plaintext for non-loopback servers unless explicitly overridden.
+5. **Packaging.** Flake outputs: a NixOS module running `workd` as a systemd
+   service, and a `dockerTools` OCI image suitable for pushing to ECR and
+   running via helm. Config via file + env vars so both styles are ergonomic.
+6. **Remote dogfood run.** Deploy to the personal NixOS server, run the
+   Milestone 1 workflow end to end from the laptop, and record findings here.
 
-## Dogfood findings (2026-07-01)
+## Working rules (carried forward)
 
-Round 2 (same day): submitted "Show tool-call targets in watch output" against
-this repo with opencode-acp. The agent edited `crates/workctl/src/main.rs`,
-the session captured a `repo-diff` artifact, `task review` rendered the diff,
-and the patch was applied to the real repo. **The definition of done has been
-exercised end to end.** Remaining polish items below.
-
-1. ~~**Blocker: generated prompts hardcode a summarize-only task.**~~ —
-   **fixed.** Prompts are now intent-driven: they describe the workspace and
-   mounted repos, permit direct working-tree changes when the task asks for
-   them, and reserve read-only behavior for analysis-style intents. In the
-   same pass, the ACP permission callback now selects an allow option instead
-   of cancelling every request — the execution context is the safety boundary,
-   not per-tool-call approval — so agents can actually edit files.
-2. Watch UX: the final `print_task` summary reprints text that already
-   streamed live, duplicating output at the end of a watched run. Minor;
-   consider suppressing the summary when it was already streamed.
-3. ~~Observation quality: tool calls stream as bare titles.~~ — **fixed by a
-   delegated task.** The round-2 agent added location paths to tool-call
-   labels; its diff was reviewed via `task review` and applied. Review caught
-   a real defect (a sed-mangled raw string terminator), validating the
-   human-review step.
-4. The loop itself held up: records, artifacts, session provenance, live
-   streaming, diff capture, and review all behaved as designed on real tasks.
-5. New (round 2): the agent's `edit` tool appeared to fail inside the
-   prepared workspace and it fell back to `bash`+`sed`, which introduced the
-   syntax error. Investigate why opencode's edit tool misbehaves under the
-   redirected HOME/XDG environment.
-
-## Working rules until this milestone is done
-
-- **No new traits.** Ten seams exist with one implementation each. A new trait
-  or a second implementation of an existing one requires a concrete feature in
-  the gap list that cannot ship without it.
+- **No new traits** unless a gap-list item cannot ship without one. (Auth
+  resolution should attach to the existing `PolicyEngine` seam or plain axum
+  middleware before earning a new trait.)
 - **No new record kinds** unless a gap-list feature reads them.
-- **Refactors ride along, never lead.** A refactor is only in scope while it is
-  blocking a gap-list item, and it lands in the same change as the feature it
-  unblocks.
-- Every landed change should move a gap-list item or fix a dogfood-discovered
-  bug. If a change does neither, it does not land.
+- **Refactors ride along, never lead.** The agent-suggested `workd` module
+  split may ride along with gap work that touches `workd`, hunk by hunk — it
+  must not become its own project.
+- Every landed change moves a gap-list item or fixes a dogfood-discovered bug.
 
 ## Why this milestone
 
-The north star names seven verbs: hand off, run, observe, claim, resume,
-review, clean up. Only the first two exist. Observation and review are the
-minimum needed to actually *use* the tool on real work; dogfooding is what
-replaces the refactor backlog with a product backlog. Claim/resume, durable
-leases, cleanup gates, and remote deployment all stay parked until this
-milestone is done.
+Everything in the long-term picture — pod/microvm executors, multiple clients,
+Linear reactions — assumes the control plane is reachable over a network and
+enforces identity. Milestone 1 deliberately leaned on a shared filesystem for
+watch and review; those are the exact seams that must become API surface
+before any other milestone can start. Auth cannot be bolted on later (north
+star non-goal), so it lands with the first remote deployment, not after.
+
+## Backlog from Milestone 1 dogfooding
+
+- Watch UX: final summary reprints text that already streamed live; suppress
+  when already streamed.
+- Investigate why opencode's `edit` tool misbehaves under the redirected
+  HOME/XDG workspace environment (agent fell back to `bash`+`sed` and mangled
+  a raw string; caught in review).
