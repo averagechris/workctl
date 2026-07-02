@@ -49,22 +49,28 @@ and:
    session runs. `task watch` tails the log and `task review` fetches diffs
    exclusively through this endpoint; the CLI no longer reads the daemon's
    filesystem at all. Authorization checks attach when gaps 2–3 land.
-2. **Token auth.** `Authorization: Bearer` on every request. First
-   implementation: static tokens declared in daemon config mapping token ->
-   user/org. Requests resolve to a `UserId`/`OrganizationId`; `local` defaults
-   remain only for a dev-mode flag. This makes the existing `user_id` fields
-   real.
-3. **Authorization.** Task visibility scoped by organization/user through the
-   existing `PolicyEngine` seam. List/get/artifact endpoints filter by the
-   authenticated identity.
-4. **TLS/transport stance.** Keep the HTTP+JSON API. Document that TLS is
-   terminated by a reverse proxy (NixOS) or ingress (k8s); `workctl` refuses
-   plaintext for non-loopback servers unless explicitly overridden.
-5. **Packaging.** Flake outputs: a NixOS module running `workd` as a systemd
-   service, and a `dockerTools` OCI image suitable for pushing to ECR and
-   running via helm. Config via file + env vars so both styles are ergonomic.
+2. ~~**Token auth.**~~ — **done.** `workd` accepts `--auth-token
+   token:user:org` entries (or `WORKD_AUTH_TOKENS`); bearer tokens resolve to
+   a user/org identity on every request. Anonymous requests resolve to the
+   local identity only when explicitly allowed or when no tokens are
+   configured on a loopback bind; non-loopback binds without tokens refuse to
+   start. `workctl` sends `--token` / `WORKCTL_TOKEN`.
+3. ~~**Authorization.**~~ — **done.** `PolicyEngine::task_visible` scopes task
+   visibility by organization. List filters; get and artifact-content return
+   404 for invisible tasks to avoid existence leaks. Submissions take their
+   user/org from the authenticated identity.
+4. ~~**TLS/transport stance.**~~ — **done.** HTTP+JSON stays; TLS terminates
+   at a reverse proxy or ingress. `workctl` refuses plaintext HTTP to
+   non-loopback servers unless `--insecure-http`.
+5. ~~**Packaging.**~~ — **done.** Flake outputs `packages.workd`,
+   `packages.workctl`, `packages.workd-image` (Linux OCI image for ECR/helm),
+   and `nixosModules.workd` (hardened systemd service with DynamicUser,
+   environment-file token config, and reverse-proxy TLS guidance). See
+   `docs/deployment.md`.
 6. **Remote dogfood run.** Deploy to the personal NixOS server, run the
    Milestone 1 workflow end to end from the laptop, and record findings here.
+   Known risk to exercise: opencode credentials for the service user (the
+   host-config symlink convenience does not exist on a fresh server).
 
 ## Working rules (carried forward)
 

@@ -236,10 +236,14 @@ byte offsets), streaming agent message text and tool-call titles between
 records. The CLI never reads the daemon's filesystem, so watch behaves
 identically against local and remote daemons.
 
-The first local identity model assigns submitted tasks to organization `local`
-and user `local`. The user ID is stored on the task row and included in the
-`input_received` snapshot so later auth/user resolution can replace the local
-default without losing audit semantics.
+The first identity model resolves bearer tokens (static `token:user:org`
+daemon configuration) to a user and organization on every request; tasks are
+assigned the authenticated identity at submission and are visible only within
+their organization. The `local` user/organization defaults now apply only to
+anonymous requests, which are allowed when explicitly enabled or when a
+tokenless daemon binds to loopback. The user ID is stored on the task row and
+included in the `input_received` snapshot so richer auth (issued tokens, SSO,
+roles) can replace the static table without losing audit semantics.
 
 Submit-time validation and default scoping run through a `PolicyEngine` trait.
 The first local policy preserves the existing CLI/API behavior: title, intent,

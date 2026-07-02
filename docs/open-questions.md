@@ -87,11 +87,14 @@ Answer these when they become implementation blockers.
 
 ## Core implementation
 
-- CLI-to-`workd` protocol: **being decided in Milestone 2** — keep HTTP+JSON,
-  bearer tokens, TLS via proxy/ingress. Revisit gRPC/other transports only if
-  the JSON API becomes a real limitation.
-- Auth mechanism beyond the local default user: **being decided in Milestone
-  2** — static config-declared tokens first; SSO/mTLS/issued tokens later.
+- CLI-to-`workd` protocol: **decided (M2)** — HTTP+JSON with bearer tokens;
+  TLS terminates at a proxy/ingress; `workctl` refuses plaintext to
+  non-loopback hosts. Revisit other transports only if this becomes a real
+  limitation.
+- Auth mechanism: **first pass done (M2)** — static config-declared
+  `token:user:org` tokens; anonymous-local only for explicit opt-in or
+  tokenless loopback binds. Issued/short-lived credentials, SSO, and mTLS
+  remain open.
 - Role model: org admins, members, service accounts, workers.
 - Control-plane lifecycle: auto-start local `workd`, configured server, or both?
 - Bootstrap config/state paths: XDG layout, Nix module shape, secrets wiring.
