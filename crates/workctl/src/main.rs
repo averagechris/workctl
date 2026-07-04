@@ -75,6 +75,11 @@ struct SubmitArgs {
     repos: Vec<String>,
     #[arg(long = "repo-name")]
     repo_names: Vec<String>,
+    #[arg(
+        long = "checkout",
+        help = "Revision (commit, tag, branch) to check out after cloning. Aligns positionally with --repo, like --repo-name."
+    )]
+    checkouts: Vec<String>,
     #[arg(long, value_enum, default_value_t = HarnessArg::OpencodeAcp)]
     harness: HarnessArg,
     #[arg(long, value_enum, default_value_t = ExecutorArg::LocalDevshell)]
@@ -233,6 +238,9 @@ fn submit_request(args: &SubmitArgs) -> Result<SubmitTaskRequest> {
     if !args.repo_names.is_empty() && args.repo_names.len() != args.repos.len() {
         bail!("--repo-name count must match --repo count when provided");
     }
+    if !args.checkouts.is_empty() && args.checkouts.len() != args.repos.len() {
+        bail!("--checkout count must match --repo count when provided");
+    }
     let repos = args
         .repos
         .iter()
@@ -244,7 +252,7 @@ fn submit_request(args: &SubmitArgs) -> Result<SubmitTaskRequest> {
                 .get(idx)
                 .cloned()
                 .unwrap_or_else(|| infer_repo_name(url)),
-            checkout: None,
+            checkout: args.checkouts.get(idx).cloned(),
         })
         .collect();
 
