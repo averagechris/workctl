@@ -172,6 +172,16 @@
       };
     };
 
+    # OrbStack dogfood machine (Milestone 2): workd behind Caddy TLS on a
+    # NixOS VM. See deploy/orbstack/README.md for the runbook.
+    nixosConfigurations.workd-dev = nixpkgs.lib.nixosSystem {
+      system = "aarch64-linux";
+      modules = [
+        self.nixosModules.workd
+        ./deploy/orbstack/configuration.nix
+      ];
+    };
+
     apps = forAllSystems (system: {
       default = self.apps.${system}.workctl;
       workctl = {
