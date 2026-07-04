@@ -98,20 +98,72 @@ and:
      client -> OrbStack TLS, OrbStack -> Caddy TLS, and Caddy -> `workd`
      loopback. `reqwest`'s default native-tls path trusts the macOS keychain;
      nix-provided `curl` uses its own CA bundle and does not.
-   - **Expected kinks that did not materialize.** `ProtectHome` did not block
-     the `/Users`-shared repo path (`ProtectHome` covers `/home`, `/root`, and
-     `/run/user`; `ProtectSystem=strict` read-only access was enough for
-     cloning). The nixpkgs opencode 1.4.6 build worked over ACP, including
-     read/edit/bash tools and empty stderr, with only a cosmetic concatenated
-     summary-text quirk. Cold-store latency was fine for the flake-less first
-     task (15s); first-run `nix develop` latency in a flake repo remains
-     untested.
+    - **Expected kinks that did not materialize.** `ProtectHome` did not block
+      the `/Users`-shared repo path (`ProtectHome` covers `/home`, `/root`, and
+      `/run/user`; `ProtectSystem=strict` read-only access was enough for
+      cloning). The nixpkgs opencode 1.4.6 build worked over ACP, including
+      read/edit/bash tools and empty stderr. Cold-store latency was fine for the
+      flake-less first task (15s), and later self-hosted changes retired the
+      first-run `nix develop` concern: earlier switch builds had warmed the VM
+      store, so devshell entry was about 3s. The cosmetic concatenated
+      summary-text quirk observed in this first remote run was later resolved by
+      `task_c75b9580ac494e638ad68cb555542b2d`.
    - **Operational notes.** The first `nixos-rebuild switch` exited 4 only
-     because a transient `dbus-broker` user-unit reload timed out in the
-     OrbStack/NixOS user session; `systemctl --user daemon-reload && systemctl
-     --user restart dbus-broker` recovered it, and an immediate re-switch was
-     clean and idempotent. Caddy logs a benign `certutil is not available` /
-     `failed to install root certificate` warning in this topology.
+      because a transient `dbus-broker` user-unit reload timed out in the
+      OrbStack/NixOS user session; `systemctl --user daemon-reload && systemctl
+      --user restart dbus-broker` recovered it, and an immediate re-switch was
+      clean and idempotent. Caddy logs a benign `certutil is not available` /
+      `failed to install root certificate` warning in this topology.
+
+### Self-hosting dogfood loop
+
+The remote-control-plane dogfood loop is now established. The first four
+self-hosted changes were executed remotely by the `workd` task worker on the
+`workd-dev` OrbStack VM, then reviewed, applied, linted, and committed to `main`
+locally:
+
+1. `task_f770c99a9a034b9daf6457e2348bd1f4` — `feat(workctl): expose --checkout
+   on submit to pin repo revisions` (~492s).
+2. `task_e2b9a523707e45cfa92bc952bef18218` — `feat(workctl): task diff
+   subcommand for raw pipeable diffs` (~150s).
+3. `task_5a8cef4f9d934bf8bd31e654dc6aa6a6` — `fix(workctl): stop reprinting the
+   streamed summary after watch` (~173s). One local test-expectation fix in
+   `crates/workctl/tests/local_loop.rs` was made during apply, not by the remote
+   agent.
+4. `task_c75b9580ac494e638ad68cb555542b2d` — `fix(workd): separate assistant
+   messages in assembled summaries via ACP messageId boundaries` (~356s).
+
+Working recipe:
+
+- Pick a small, precisely-scoped backlog item; include explicit file targets and
+  verification commands in the intent.
+- Submit against `WORKD_URL=https://workd-dev.orb.local` with
+  `workctl submit --repo /Users/chris/projects/workctl --checkout <main-sha> --watch`.
+  Tasks clone committed `HEAD`; `--checkout` pins the base revision; the single
+  worker means execution is strictly serial.
+- Retrieve the result with `workctl task diff <id> | git apply -`. The `task
+  diff` subcommand from iteration 2 replaces the earlier `workctl task review
+  --json | jq` extraction dance.
+- Validate locally (`cargo test` plus the full lint suite), review the diff,
+  describe it, and advance `main`.
+- When `workd`-side changes land, redeploy the VM with `nixos-rebuild switch`.
+
+Current sizing and verification notes:
+
+- The serial single-worker queue and the 900s server-side ACP cap shape viable
+  task size. The first four self-hosted changes took about 2.5–8 minutes each,
+  including in-task cargo verification. That is fine for small items;
+  concurrency and configurable timeouts remain known gaps.
+- Remote agents verify only unit-testable scope in-task. Integration tests cannot
+  run in the sandbox yet because the `workd` binary is unavailable there, and
+  one task also exposed a noexec build-script issue. Apply-side local validation
+  covers the full test/lint suite.
+- The first self-hosted task hit a noexec filesystem when cargo build scripts
+  tried to execute during in-task verification, then worked around it by building
+  from a different writable directory. The cause is not yet investigated;
+  candidates include workspace temp placement, `PrivateTmp`, or mount flags under
+  `/var/lib/private`. Tasks still succeed, but this should be understood before
+  relying on heavier in-task builds.
 
 ## Working rules (carried forward)
 
@@ -135,8 +187,11 @@ star non-goal), so it lands with the first remote deployment, not after.
 
 ## Backlog from Milestone 1 dogfooding
 
-- Watch UX: final summary reprints text that already streamed live; suppress
-  when already streamed.
+- ~~Watch UX: final summary reprints text that already streamed live; suppress
+  when already streamed.~~ — **resolved by
+  `task_5a8cef4f9d934bf8bd31e654dc6aa6a6`.**
 - Investigate why opencode's `edit` tool misbehaves under the redirected
   HOME/XDG workspace environment (agent fell back to `bash`+`sed` and mangled
   a raw string; caught in review).
+- ~~ACP summary assembly concatenates adjacent assistant-message text without a
+  separator.~~ — **resolved by `task_c75b9580ac494e638ad68cb555542b2d`.**

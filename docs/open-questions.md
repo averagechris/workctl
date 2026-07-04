@@ -107,6 +107,11 @@ Answer these when they become implementation blockers.
 
 - How to locate and mount non-Git sources, existing checkouts, jj workspaces,
   snapshots, volumes, or multi-repo context bundles.
+- Why the self-hosted dogfood task workspace hit a noexec filesystem for cargo
+  build scripts during in-task verification. Candidates include workspace temp
+  placement, `PrivateTmp`, or mount flags under `/var/lib/private`. Small tasks
+  can work around it by building from another writable directory, but heavier
+  in-task builds should not depend on that accident.
 - How to inject secrets safely across process/container/isolate/VM/pod runtimes.
 - Per-user provider credential store (see requirements "Provider
   credentials"): encryption at rest, KMS/agenix integration, rotation,
