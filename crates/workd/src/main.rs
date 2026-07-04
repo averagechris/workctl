@@ -1740,7 +1740,7 @@ async fn run_opencode_acp(
     )
     .await?;
 
-    let mut chunks = Vec::new();
+    let mut chunks: Vec<String> = Vec::new();
     timeout(
         Duration::from_secs(OPENCODE_TIMEOUT_SECS),
         read_prompt_response(&mut reader, &mut stdin, &mut log, prompt_id, &mut chunks),
@@ -1829,6 +1829,7 @@ async fn read_prompt_response(
     target_id: u64,
     chunks: &mut Vec<String>,
 ) -> Result<Value> {
+    let mut last_message_id: Option<String> = None;
     loop {
         let Some(line) = reader.next_line().await? else {
             bail!("ACP process closed stdout before response {target_id}");
@@ -1840,6 +1841,22 @@ async fn read_prompt_response(
                 .pointer("/params/update/content/text")
                 .and_then(Value::as_str)
         {
+            // The ACP protocol includes an optional `messageId` on each
+            // agent_message_chunk.  Chunks sharing the same messageId
+            // belong to one streaming assistant message; a different
+            // messageId signals a new message, so we insert a blank-line
+            // separator.  When messageId is absent (compact path) we
+            // conservatively treat all chunks as the same message.
+            let message_id = message
+                .pointer("/params/update/messageId")
+                .and_then(Value::as_str)
+                .map(String::from);
+            if message_id != last_message_id {
+                if !chunks.is_empty() {
+                    chunks.push("\n\n".to_string());
+                }
+                last_message_id = message_id;
+            }
             chunks.push(text.to_string());
         }
         if let Some(response) = handle_message(stdin, log, &message, target_id).await? {
@@ -2709,5 +2726,88 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    /// Simulate the chunk-collection logic from read_prompt_response.
+    /// agent_message_chunk updates with the same messageId are streaming
+    /// deltas of one assistant message; different messageIds produce a
+    /// blank-line separator in the assembled summary.
+    fn collect_agent_chunks(messages: &[serde_json::Value]) -> Vec<String> {
+        let mut chunks: Vec<String> = Vec::new();
+        let mut last_message_id: Option<String> = None;
+        for msg in messages {
+            if !is_agent_text_chunk(msg) {
+                continue;
+            }
+            let Some(text) = msg
+                .pointer("/params/update/content/text")
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let message_id = msg
+                .pointer("/params/update/messageId")
+                .and_then(Value::as_str)
+                .map(String::from);
+            if message_id != last_message_id {
+                if !chunks.is_empty() {
+                    chunks.push("\n\n".to_string());
+                }
+                last_message_id = message_id;
+            }
+            chunks.push(text.to_string());
+        }
+        chunks
+    }
+
+    #[test]
+    fn agent_text_chunks_separate_on_message_id_change() {
+        let same_msg_a: serde_json::Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","messageId":"m1","content":{"type":"text","text":"Hello "}}}}"#,
+        )
+        .unwrap();
+        let same_msg_b: serde_json::Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","messageId":"m1","content":{"type":"text","text":"world!"}}}}"#,
+        )
+        .unwrap();
+        let new_msg: serde_json::Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","messageId":"m2","content":{"type":"text","text":"Second message"}}}}"#,
+        )
+        .unwrap();
+
+        let chunks = collect_agent_chunks(&[same_msg_a, same_msg_b, new_msg]);
+        let summary = chunks.join("");
+        assert_eq!(summary, "Hello world!\n\nSecond message");
+    }
+
+    #[test]
+    fn agent_text_chunks_without_message_id_not_separated() {
+        // When messageId is absent (compact path), chunks are not separated.
+        let a: serde_json::Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello "}}}}"#,
+        )
+        .unwrap();
+        let b: serde_json::Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"world!"}}}}"#,
+        )
+        .unwrap();
+
+        let chunks = collect_agent_chunks(&[a, b]);
+        let summary = chunks.join("");
+        assert_eq!(summary, "Hello world!");
+    }
+
+    #[test]
+    fn non_text_session_updates_are_skipped() {
+        let tool_call: serde_json::Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","title":"read"}}}"#,
+        )
+        .unwrap();
+        assert!(!is_agent_text_chunk(&tool_call));
+
+        let unrelated: serde_json::Value =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#)
+                .unwrap();
+        assert!(!is_agent_text_chunk(&unrelated));
     }
 }
