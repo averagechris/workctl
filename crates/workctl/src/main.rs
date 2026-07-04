@@ -665,16 +665,24 @@ fn print_task(json: bool, task: &Task) -> Result<()> {
     Ok(())
 }
 
-/// Final line after a watch stream. In JSON mode the stream is NDJSON records,
-/// so the final task is emitted as a single compact JSON line rather than the
-/// pretty form used by `task get`.
+/// Final line after a watch stream. The summary was already streamed live
+/// through the harness log, so we only print a concise state line. In JSON
+/// mode the stream is NDJSON records, so the final task is emitted as a
+/// single compact JSON line rather than the pretty form used by `task get`.
 fn print_watch_final(json: bool, task: &Task) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string(task)?);
-        Ok(())
     } else {
-        print_task(false, task)
+        println!("task {} {}", task.id, task.state);
+        if let Some(error) = &task.last_error {
+            println!("error: {error}");
+        }
+        println!(
+            "(see `task review {}` for the full summary and diffs)",
+            task.id
+        );
     }
+    Ok(())
 }
 
 struct Client {

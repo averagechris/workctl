@@ -391,7 +391,11 @@ fn cli_watch_streams_records_until_terminal_state() {
         stdout.contains(&format!("task {task_id} done")),
         "stdout={stdout}"
     );
-    assert!(stdout.contains("README.md"), "stdout={stdout}");
+    assert!(
+        stdout.contains(&format!("task review {task_id}")),
+        "stdout={stdout}"
+    );
+    assert!(!stdout.contains("README.md"), "stdout={stdout}");
 
     assert!(
         review_output.status.success(),
