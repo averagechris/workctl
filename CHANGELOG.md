@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+
+## v0.1.0 - 2026-07-04
+
 ### Added
 
 - Initial public release of the `workctl` CLI and the `workd` control plane.
