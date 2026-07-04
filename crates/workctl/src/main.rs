@@ -54,6 +54,11 @@ enum TaskCommand {
     Review {
         task_id: String,
     },
+    Diff {
+        task_id: String,
+        #[arg(long)]
+        repo: Option<String>,
+    },
     Outputs {
         task_id: String,
     },
@@ -172,6 +177,12 @@ async fn main() -> Result<()> {
         } => {
             let task = client.get(&task_id).await?;
             review_task(&client, cli.json, &task).await?;
+        }
+        Command::Task {
+            command: TaskCommand::Diff { task_id, repo },
+        } => {
+            let task = client.get(&task_id).await?;
+            diff_task(&client, cli.json, &task, repo.as_deref()).await?;
         }
         Command::Task {
             command: TaskCommand::Get { task_id },
@@ -584,6 +595,56 @@ async fn review_task(client: &Client, json: bool, task: &Task) -> Result<()> {
         match content {
             Some(diff) => println!("\n## Diff: {path}\n\n{diff}"),
             None => println!("\n## Diff: {path}\n\n(content could not be fetched)"),
+        }
+    }
+    Ok(())
+}
+
+/// Raw pipeable diffs: emit only the diff content (no headings, no summary,
+/// no prose) so the output can be piped directly to `git apply`.  With
+/// `--json` emit a `{path, content}[]` array matching the review shape.
+async fn diff_task(
+    client: &Client,
+    json: bool,
+    task: &Task,
+    repo_filter: Option<&str>,
+) -> Result<()> {
+    let mut diffs: Vec<(String, String)> = Vec::new();
+    for (position, artifact) in task.artifacts.iter().enumerate() {
+        if artifact.kind != "repo-diff" {
+            continue;
+        }
+        if let Some(name) = repo_filter {
+            let stem = std::path::Path::new(&artifact.path)
+                .file_stem()
+                .and_then(std::ffi::OsStr::to_str);
+            if stem != Some(name) {
+                continue;
+            }
+        }
+        let content = client
+            .artifact_content(&task.id.to_string(), position, 0)
+            .await
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())?;
+        diffs.push((artifact.path.clone(), content));
+    }
+
+    if diffs.is_empty() {
+        if let Some(name) = repo_filter {
+            bail!("no repo-diff artifact found matching repo name: {name}");
+        }
+        bail!("task has no repo-diff artifacts");
+    }
+
+    if json {
+        let value: Vec<_> = diffs
+            .iter()
+            .map(|(path, content)| serde_json::json!({"path": path, "content": content}))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        for (_path, content) in &diffs {
+            print!("{content}");
         }
     }
     Ok(())
