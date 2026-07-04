@@ -108,6 +108,18 @@ Answer these when they become implementation blockers.
 - How to locate and mount non-Git sources, existing checkouts, jj workspaces,
   snapshots, volumes, or multi-repo context bundles.
 - How to inject secrets safely across process/container/isolate/VM/pod runtimes.
+- Per-user provider credential store (see requirements "Provider
+  credentials"): encryption at rest, KMS/agenix integration, rotation,
+  self-service CLI surface (e.g. `workctl credential set`), and audit records
+  for credential changes. Likely lands with Milestone 3 secrets injection. The
+  OrbStack dogfood also showed that provisioning provider files by `sudo cp`
+  into a `DynamicUser` `StateDirectory` is fragile: root-owned
+  `/var/lib/workd/xdg` directories broke opencode when the harness symlinked
+  host XDG state into the task workspace and Bun tried to create
+  `opencode/log/`. Decide whether workd should copy, not symlink, opencode
+  state into workspaces, whether the NixOS module should expose explicit
+  credential paths, or whether systemd `LoadCredential` is the right bootstrap
+  mechanism.
 - Which harness to implement first: OpenCode, `pi`, ACP, or another.
 - How to represent source/context anchors and non-exportable contexts.
 

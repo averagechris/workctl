@@ -67,10 +67,51 @@ and:
    and `nixosModules.workd` (hardened systemd service with DynamicUser,
    environment-file token config, and reverse-proxy TLS guidance). See
    `docs/deployment.md`.
-6. **Remote dogfood run.** Deploy to the personal NixOS server, run the
-   Milestone 1 workflow end to end from the laptop, and record findings here.
-   Known risk to exercise: opencode credentials for the service user (the
-   host-config symlink convenience does not exist on a fresh server).
+6. ~~**Remote dogfood run.**~~ — **done (2026-07-04).** Executed the Milestone 1
+   workflow from macOS against the OrbStack NixOS VM on suremac at
+   `https://workd-dev.orb.local`: `submit --watch` streamed progressively,
+   `task review` fetched the diff remotely via the artifact API, attribution was
+   `user=chris org=dev`, and the flake-less task completed in 15s. Auth checks
+   matched the M2 stance: `/health` is public, while API paths return 401 for
+   missing (`missing bearer token`) and bogus (`invalid bearer token`) tokens.
+
+   Findings:
+
+   - **Real blocker: provisioned opencode state ownership.** The runbook's
+     `sudo mkdir -p` + `sudo cp` left `/var/lib/workd/xdg/{,data,data/opencode}`
+     owned `root:root` `0755`. `workd` symlinks the host XDG opencode directory
+     into each per-task workspace (`mount_opencode_state`), and opencode/Bun
+     needs to create `opencode/log/` inside it. That failed with `EACCES`, which
+     surfaced as the harness error `initialize returned no response` after about
+     2s. Fix: `chown -R` the XDG tree to the `StateDirectory` owner (the
+     `DynamicUser` mapping, uid 65534 in this LXC setup) and restart `workd`.
+     Deeper design question stays with provider credentials: provisioning by
+     `sudo cp` into a `DynamicUser` `StateDirectory` is fragile; candidates are
+     copying, not symlinking, opencode state into the workspace, a module option
+     for credential paths, or systemd `LoadCredential`.
+   - **TLS surprise: OrbStack fronts `*.orb.local`.** From macOS the visible
+     certificate is `CN=workd-dev.orb.local`, issued by "OrbStack Development
+     Root CA", already trusted in the System keychain. OrbStack terminates TLS
+     host-side and forwards to the VM's `:443`, where Caddy re-terminates with
+     its `tls internal` cert. Net: no Caddy-root trust step and no
+     `--insecure-http` on OrbStack; the reverse-proxy stance is still exercised
+     client -> OrbStack TLS, OrbStack -> Caddy TLS, and Caddy -> `workd`
+     loopback. `reqwest`'s default native-tls path trusts the macOS keychain;
+     nix-provided `curl` uses its own CA bundle and does not.
+   - **Expected kinks that did not materialize.** `ProtectHome` did not block
+     the `/Users`-shared repo path (`ProtectHome` covers `/home`, `/root`, and
+     `/run/user`; `ProtectSystem=strict` read-only access was enough for
+     cloning). The nixpkgs opencode 1.4.6 build worked over ACP, including
+     read/edit/bash tools and empty stderr, with only a cosmetic concatenated
+     summary-text quirk. Cold-store latency was fine for the flake-less first
+     task (15s); first-run `nix develop` latency in a flake repo remains
+     untested.
+   - **Operational notes.** The first `nixos-rebuild switch` exited 4 only
+     because a transient `dbus-broker` user-unit reload timed out in the
+     OrbStack/NixOS user session; `systemctl --user daemon-reload && systemctl
+     --user restart dbus-broker` recovered it, and an immediate re-switch was
+     clean and idempotent. Caddy logs a benign `certutil is not available` /
+     `failed to install root certificate` warning in this topology.
 
 ## Working rules (carried forward)
 

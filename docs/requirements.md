@@ -58,6 +58,23 @@ This document states baseline requirements and decisions.
   delivery tables/views are allowed later for query speed but must not become the
   only source of truth.
 
+## Provider credentials
+
+- Inference/provider credentials (OpenRouter, Anthropic, and other agent
+  backends) are per-user control-plane state. Each user configures their own
+  credentials self-service; they are not global daemon configuration.
+- Credentials are dynamically configurable without redeploying `workd`, and
+  scoped by organization/user like other dynamic config.
+- Context preparation injects the submitting user's provider credentials into
+  the execution context, materialized in the harness's native format (e.g. an
+  opencode `auth.json`). Secret values never appear in manifests, task
+  records, artifacts, or logs.
+- Storage must protect secrets at rest; the mechanism (encryption approach,
+  KMS/agenix integration, rotation) is an open question.
+- Bootstrap state: statically provisioned host-level credentials for the
+  daemon's service user. This is temporary and must be replaced by the
+  per-user store before any multi-user deployment.
+
 ## Context preparation
 
 - Context preparation turns a task into a ready execution environment.

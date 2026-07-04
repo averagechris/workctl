@@ -2,6 +2,8 @@
 
 Two supported styles, both from this flake, no lock-in. TLS always terminates
 in front of workd (reverse proxy or ingress); workd itself speaks plain HTTP.
+For the development deployment on an OrbStack VM, see
+`orbstack-dogfood-plan.md`.
 
 ## Style 1: NixOS server (personal)
 
