@@ -534,11 +534,13 @@ async fn process_task(
             .complete_with_summary(
                 store,
                 &mut task,
-                &session_id,
-                action_id,
-                harness_run.summary,
-                summary_artifact_path,
-                harness_run.artifacts,
+                CompletionSummary {
+                    session_id: &session_id,
+                    action_id,
+                    summary: harness_run.summary,
+                    summary_artifact_path,
+                    harness_artifacts: harness_run.artifacts,
+                },
             )
             .await?;
         Result::<()>::Ok(())
@@ -602,6 +604,14 @@ impl ActionQueue for LocalCreatedTaskQueue {
 struct TaskClaim {
     claim_id: String,
     task_id: TaskId,
+}
+
+struct CompletionSummary<'a> {
+    session_id: &'a SessionId,
+    action_id: &'a ActionId,
+    summary: String,
+    summary_artifact_path: String,
+    harness_artifacts: Vec<GeneratedArtifact>,
 }
 
 #[async_trait]
@@ -681,11 +691,7 @@ trait TaskLifecycle: Send + Sync {
         &self,
         store: &dyn ControlStore,
         task: &mut Task,
-        session_id: &SessionId,
-        action_id: &ActionId,
-        summary: String,
-        summary_artifact_path: String,
-        harness_artifacts: Vec<GeneratedArtifact>,
+        completion: CompletionSummary<'_>,
     ) -> Result<()>;
 
     async fn start_session(
@@ -839,12 +845,15 @@ impl TaskLifecycle for LocalTaskLifecycle {
         &self,
         store: &dyn ControlStore,
         task: &mut Task,
-        session_id: &SessionId,
-        action_id: &ActionId,
-        summary: String,
-        summary_artifact_path: String,
-        harness_artifacts: Vec<GeneratedArtifact>,
+        completion: CompletionSummary<'_>,
     ) -> Result<()> {
+        let CompletionSummary {
+            session_id,
+            action_id,
+            summary,
+            summary_artifact_path,
+            harness_artifacts,
+        } = completion;
         task.summary = Some(summary.clone());
         let now = now_ms();
         for artifact in harness_artifacts {
