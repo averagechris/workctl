@@ -128,3 +128,12 @@ workctl task artifacts <task-id>
 The default test path uses `--harness fake-summary` so CI does not need network,
 SSH, or LLM credentials. The real Sourcehut/OpenCode E2E is ignored by default
 and can be run explicitly with `WORKCTL_E2E_OPENCODE=1 cargo test -- --ignored`.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.

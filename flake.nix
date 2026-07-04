@@ -73,6 +73,9 @@
           chmod 0555 "$stage/workctl" "$stage/workd"
           cp -p ${./README.md} "$stage/README.md"
           cp -p ${./CHANGELOG.md} "$stage/CHANGELOG.md"
+          cp -p ${./LICENSE} "$stage/LICENSE"
+          cp -p ${./LICENSE-APACHE} "$stage/LICENSE-APACHE"
+          cp -p ${./LICENSE-MIT} "$stage/LICENSE-MIT"
 
           tar \
             --sort=name \
