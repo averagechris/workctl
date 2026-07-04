@@ -63,6 +63,18 @@ nix develop
 Static pre-push checks are configured for `jj lint`. They intentionally run
 formatters and static analysis for Rust and Nix code, not the full test suite.
 
+Fleet release helpers are exposed through the flake:
+
+```sh
+nix run .#prepare-release -- --version X.Y.Z
+nix build .#release-artifact
+nix run .#build-pages -- --include-existing-downloads
+nix run .#release -- --version X.Y.Z --publish-pages --submit-linux-build
+```
+
+Release builds use `builds/release-linux-x86_64.yml` and publish pages under the
+`/workctl` Sourcehut Pages subdirectory.
+
 The dev shell also includes dependency-management and supply-chain tooling:
 
 - `cargo audit` for RustSec vulnerability audits.

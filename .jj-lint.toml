@@ -6,4 +6,7 @@ lints = [
   { name = "rust dependency hygiene", command = "cargo sort --workspace --check && cargo machete --with-metadata --skip-target-dir" },
   { name = "rust dependency policy", command = "cargo deny check bans licenses sources" },
   { name = "rust security audit", command = "cargo audit --deny warnings" },
+  { name = "ci fmt", command = "nix run .#ci-fmt" },
+  { name = "ci clippy", command = "nix run .#ci-clippy" },
+  { name = "ci test", command = "nix run .#ci-test" },
 ]
