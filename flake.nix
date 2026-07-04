@@ -192,7 +192,7 @@
       };
       releaseTag = pkgs.writeShellApplication {
         name = "release-tag";
-        runtimeInputs = with pkgs; [git jj python3];
+        runtimeInputs = with pkgs; [git jujutsu python3];
         text = ''
           if [[ $# -eq 1 && ( "$1" == "-h" || "$1" == "--help" ) ]]; then
             printf 'usage: %s [--revision REV]\n' "$0"
@@ -266,7 +266,7 @@
       };
       release = pkgs.writeShellApplication {
         name = "release";
-        runtimeInputs = with pkgs; [git hut jj nix python3];
+        runtimeInputs = with pkgs; [git hut jujutsu nix python3] ++ rustToolchain;
         text = ''
           repo_root="$(git rev-parse --show-toplevel)"
           cd "$repo_root"
