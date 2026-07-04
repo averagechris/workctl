@@ -38,6 +38,9 @@
         cargoBuildFlags = ["-p" pname];
         doCheck = false;
 
+        nativeBuildInputs = nixpkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.pkg-config];
+        buildInputs = nixpkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.openssl];
+
         meta = {
           description = "A Rust control plane for delegated software-development tasks";
           mainProgram = pname;
