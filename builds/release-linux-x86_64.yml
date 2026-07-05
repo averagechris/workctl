@@ -54,5 +54,5 @@ tasks:
       EOF
       hut builds submit "$manifest" --note "site refresh: workctl $tag" --visibility unlisted
 artifacts:
-  - artifacts/workctl-v0.1.0-x86_64-linux.tar.gz
-  - artifacts/workctl-v0.1.0-x86_64-linux.tar.gz.sha256
+  - artifacts/workctl-v0.1.1-x86_64-linux.tar.gz
+  - artifacts/workctl-v0.1.1-x86_64-linux.tar.gz.sha256

@@ -24,11 +24,11 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1783222064,
-        "narHash": "sha256-oD3LfdGblNu96qSe7wcM6xetLPDsGdC3nc8+nQbtSGs=",
+        "lastModified": 1783231882,
+        "narHash": "sha256-ZXM2M1p1e7OIh77SSDlFykg8hbOAHfIx0G+pIzrAfGU=",
         "ref": "refs/heads/main",
-        "rev": "6ee45510d65978463d70b920f34c0f503ab710c2",
-        "revCount": 17,
+        "rev": "f4a434dfe2a14a83b2452623f525037802123930",
+        "revCount": 22,
         "type": "git",
         "url": "https://git.sr.ht/~averagechris/averagechris.srht.site"
       },

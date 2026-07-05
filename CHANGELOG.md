@@ -3,6 +3,13 @@
 ## Unreleased
 
 
+## v0.1.1 - 2026-07-04
+
+### Changed
+
+- Adopt the shared fleet release tooling; releases now attach artifacts to
+  annotated tags and the downloads site is rendered centrally.
+- Linux packages now build correctly (pkg-config/openssl provided).
 ## v0.1.0 - 2026-07-04
 
 ### Added

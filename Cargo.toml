@@ -3,7 +3,7 @@ members = ["crates/workctl", "crates/workctl-core", "crates/workd"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A Rust control plane for delegated software-development tasks."
@@ -26,4 +26,4 @@ tokio = { version = "1.48.0", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 uuid = { version = "1.19.0", features = ["v4", "serde"] }
-workctl-core = { path = "crates/workctl-core", version = "0.1.0" }
+workctl-core = { path = "crates/workctl-core", version = "0.1.1" }
