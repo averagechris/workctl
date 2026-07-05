@@ -13,12 +13,8 @@ tasks:
       cp -p result-release-artifact/* ~/artifacts/
   - upload-and-refresh: |
       cd workctl
-      version="$(python3 - <<'PY'
-      import tomllib
-      with open('Cargo.toml', 'rb') as handle:
-          print(tomllib.load(handle)['workspace']['package']['version'])
-      PY
-      )"
+      hut() { nix shell nixpkgs#hut --command hut "$@"; }
+      version="$(awk '/^\[workspace\.package\]/{s=1} s && /^version = /{gsub(/"/,"",$3); print $3; exit}' Cargo.toml)"
       tag="v${version#v}"
       commit="$(git rev-parse HEAD)"
 
