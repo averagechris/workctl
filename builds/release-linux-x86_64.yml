@@ -18,13 +18,7 @@ tasks:
       tag="v${version#v}"
       commit="$(git rev-parse HEAD)"
 
-      mkdir -p ~/.config/hut
-      token="$(cat ~/.oauth-token)"
-      cat > ~/.config/hut/config <<EOF
-      instance "sr.ht" {
-          access-token "$token"
-      }
-      EOF
+      # jobs with an oauth grant get ~/.config/hut/config pre-provisioned
 
       for artifact in result-release-artifact/*.tar.gz; do
         hut git artifact upload -r workctl --rev "$tag" "$artifact" "$artifact.sha256"
