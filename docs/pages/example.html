@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>workctl task lifecycle example</title><script>(function(){var stored=null;try{stored=localStorage.getItem("theme")}catch(e){}var system=matchMedia("(prefers-color-scheme: dark)").matches?"moon":"dawn";document.documentElement.dataset.theme=stored||system})();</script><style>:root,:root[data-theme="dawn"]{--base:#faf4ed;--surface:#fffaf3;--overlay:#f2e9e1;--hl-med:#dfdad9;--muted:#9893a5;--subtle:#797593;--text:#575279;--love:#b4637a;--rose:#d7827e;--pine:#286983;--foam:#56949f}:root[data-theme="moon"]{--base:#232136;--surface:#2a273f;--overlay:#393552;--hl-med:#44415a;--muted:#6e6a86;--subtle:#908caa;--text:#e0def4;--love:#eb6f92;--rose:#ea9a97;--pine:#3e8fb0;--foam:#9ccfd8}*{box-sizing:border-box}body{background:radial-gradient(circle at top left,color-mix(in srgb,var(--rose) 18%,transparent),transparent 30rem),radial-gradient(circle at 90% 10%,color-mix(in srgb,var(--foam) 16%,transparent),transparent 24rem),var(--base);color:var(--text);font-family:Charter,Georgia,"Iowan Old Style",serif;line-height:1.65;max-width:1080px;margin:0 auto;padding:3rem 1.25rem 4rem;transition:background .25s ease,color .25s ease}a{color:var(--pine);text-decoration-color:color-mix(in srgb,var(--pine) 40%,transparent)}a:hover{color:var(--rose)}.masthead{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem}.home-link{color:var(--subtle);font-style:italic;margin:.25rem 0 0;font-size:.95rem}.theme-toggle{background:var(--surface);border:1px solid var(--hl-med);color:var(--subtle);border-radius:999px;padding:.3rem .8rem;cursor:pointer;font-family:inherit;font-size:.85rem;font-style:italic;flex-shrink:0;margin-top:.5rem}.theme-toggle:hover{border-color:var(--rose);color:var(--text)}.hero{padding:4rem 0 2rem}.eyebrow{color:var(--muted);font-size:.8rem;font-weight:700;letter-spacing:.08em;margin:0 0 .75rem;text-transform:uppercase}h1{font-size:clamp(2.5rem,8vw,5rem);line-height:.95;letter-spacing:-.06em;margin:0}.lede{font-size:clamp(1.15rem,3vw,1.55rem);max-width:790px;color:var(--subtle);margin:1.25rem 0 1.5rem}h2{font-size:clamp(1.6rem,4vw,2.35rem);margin:3rem 0 1rem;letter-spacing:-.02em}h3{font-size:1.1rem;margin:0 0 .45rem}.actions{display:flex;flex-wrap:wrap;gap:.75rem}.button,.pill{border:1px solid var(--hl-med);border-radius:999px;background:var(--surface);padding:.55rem .9rem;font-family:ui-monospace,Menlo,monospace;font-size:.92rem;box-shadow:2px 2px 0 var(--hl-med)}.button.primary{background:var(--pine);border-color:var(--pine);color:var(--base);font-weight:700;text-decoration:none}.grid{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(250px,1fr))}.card,.transcript,.sample-card{background:color-mix(in srgb,var(--surface) 92%,transparent);border:1px solid var(--hl-med);border-radius:12px;padding:1.1rem;box-shadow:2px 2px 0 var(--hl-med)}.card p{margin:0;color:var(--subtle)}pre{background:var(--overlay);border:1px solid var(--hl-med);border-radius:10px;padding:1rem;overflow-x:auto;margin:.85rem 0 0}code{font-family:ui-monospace,Menlo,monospace;font-size:.9rem}.sample-card{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-top:1.25rem;text-decoration:none;color:var(--text)}footer{color:var(--muted);font-size:.88rem;margin-top:3.5rem;font-style:italic;text-align:center}@media(max-width:720px){body{padding-top:1.5rem}.masthead,.sample-card{flex-direction:column}}</style></head><body><div class="masthead"><p class="home-link"><a href="https://averagechris.srht.site/">~averagechris</a> / workctl / <a href="index.html">downloads</a> / example</p><button class="theme-toggle" id="theme-toggle" aria-label="toggle color theme">dawn &frasl; moon</button></div><header class="hero"><p class="eyebrow">Example</p><h1>A realistic task lifecycle through workctl.</h1><p class="lede">This transcript uses real command names and flags from <code>workctl --help</code>. IDs, summaries, paths, and diffs are representative sample output.</p><div class="actions"><a class="button primary" href="index.html">Install / download</a><a class="button" href="overview.html">Read the overview</a><a class="button" href="https://git.sr.ht/~averagechris/workctl">Source repository</a></div></header><section><h2>Submit and watch</h2><div class="transcript"><p>The user asks a worker to edit a repository at a specific checkout. <code>--watch</code> streams task records plus harness text and tool calls until the task reaches a terminal state.</p><pre><code>$ workctl task submit \
+    --title "Add a JSON health check to widgetd" \
+    --intent "In the widgetd service, add a /healthz endpoint that returns JSON with status and version, update tests, and leave a concise summary." \
+    --repo git@git.sr.ht:~example/widgetd \
+    --repo-name widgetd \
+    --checkout main \
+    --harness opencode-acp \
+    --executor local-devshell \
+    --watch
+task 018f4f54-10c7-74c0-a9df-cc742a1d5f0b created
+[+    0.0s] state_changed created -&gt; metadata_ready
+[+    0.1s] input_received title="Add a JSON health check to widgetd" user=local
+[+    0.5s] task_claimed claim=clm_01jz8p9d4r node=local
+[+    1.4s] state_changed metadata_ready -&gt; context_requested
+[+    4.8s] context_prepared context=ctx_01jz8pa1s2 workspace=/Users/chris/.local/share/workctl/tasks/018f4f54-10c7-74c0-a9df-cc742a1d5f0b
+[+    4.9s] artifact_created context-manifest artifacts/context-manifest.json
+[+    5.1s] state_changed context_ready -&gt; running
+I will inspect the service routes and tests, then make the endpoint change.
+[harness] tool: read crates/widgetd/src/main.rs
+[harness] tool: edit crates/widgetd/src/main.rs
+[harness] tool: shell cargo test -p widgetd
+Tests pass. I added /healthz and covered the JSON response.
+[+   43.6s] artifact_created opencode-acp-log artifacts/opencode-acp.ndjson
+[+   43.7s] artifact_created repo-diff artifacts/widgetd.diff
+[+   43.8s] output_created Summary
+[+   43.9s] state_changed running -&gt; done
+task 018f4f54-10c7-74c0-a9df-cc742a1d5f0b done
+(see `task review 018f4f54-10c7-74c0-a9df-cc742a1d5f0b` for the full summary and diffs)</code></pre></div></section><section><h2>Inspect outputs, records, and artifacts</h2><div class="grid"><article class="card"><h3>Outputs</h3><p>Human-facing results, including summaries, are durable task outputs.</p><pre><code>$ workctl task outputs 018f4f54-10c7-74c0-a9df-cc742a1d5f0b
+out_01jz8pbr8k	Summary	Summary</code></pre></article><article class="card"><h3>Records</h3><p>The task history can be replayed or projected into another system.</p><pre><code>$ workctl task records 018f4f54-10c7-74c0-a9df-cc742a1d5f0b
+rec_01jz8p8x2a	StateChanged	Task
+rec_01jz8p8x31	InputReceived	Task
+rec_01jz8p9d4r	TaskClaimed	Task
+rec_01jz8pa1s2	ContextPrepared	Task
+rec_01jz8pbr8k	OutputCreated	Task</code></pre></article><article class="card"><h3>Artifacts</h3><p>Large data stays artifact-backed and can be fetched by the daemon when needed.</p><pre><code>$ workctl task artifacts 018f4f54-10c7-74c0-a9df-cc742a1d5f0b
+context-manifest	artifacts/context-manifest.json
+opencode-acp-log	artifacts/opencode-acp.ndjson
+repo-diff	artifacts/widgetd.diff
+summary	artifacts/summary.md</code></pre></article></div></section><section><h2>Review the captured change</h2><div class="transcript"><p><code>workctl task diff</code> emits raw diff content, which can be piped to a pager or patch tool. <code>--repo</code> filters when a task mounted multiple repositories.</p><pre><code>$ workctl task diff 018f4f54-10c7-74c0-a9df-cc742a1d5f0b --repo widgetd
+@@ -18,6 +18,11 @@ async fn router() -&gt; Router {
+     Router::new()
+         .route("/", get(index))
++        .route("/healthz", get(healthz))
+ }
+
++async fn healthz() -&gt; Json&lt;Health&gt; {
++    Json(Health { status: "ok", version: env!("CARGO_PKG_VERSION") })
++}
+
+diff --git a/crates/widgetd/tests/health.rs b/crates/widgetd/tests/health.rs
+new file mode 100644
+@@ -0,0 +1,8 @@
++#[tokio::test]
++async fn healthz_returns_status_and_version() {
++    let response = get("/healthz").await;
++    assert_eq!(response.status(), 200);
++    assert_eq!(response.json()["status"], "ok");
++}</code></pre></div><a class="sample-card" href="overview.html"><span><strong>Back to the overview</strong><br>Read how tasks, workers, harnesses, executors, records, outputs, and artifacts fit together.</span><span class="button primary">overview.html</span></a></section><footer>Representative sample output; use <code>--json</code> on task commands for structured automation.</footer><script>document.getElementById("theme-toggle").addEventListener("click",function(){var next=document.documentElement.dataset.theme==="moon"?"dawn":"moon";document.documentElement.dataset.theme=next;try{localStorage.setItem("theme",next)}catch(e){}});matchMedia("(prefers-color-scheme: dark)").addEventListener("change",function(event){var stored=null;try{stored=localStorage.getItem("theme")}catch(e){}if(!stored)document.documentElement.dataset.theme=event.matches?"moon":"dawn"});</script></body></html>
