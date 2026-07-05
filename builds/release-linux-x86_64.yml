@@ -1,6 +1,6 @@
 image: nixos/unstable
 arch: x86_64
-oauth: git.sr.ht/OBJECTS:RW builds.sr.ht/JOBS:RW
+oauth: git.sr.ht/OBJECTS:RW builds.sr.ht/JOBS:RW meta.sr.ht/PROFILE:RO
 environment:
   NIX_CONFIG: "experimental-features = nix-command flakes"
 sources:
