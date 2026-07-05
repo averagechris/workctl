@@ -1,22 +1,58 @@
 image: nixos/unstable
 arch: x86_64
-oauth: pages.sr.ht/PAGES:RW
+oauth: git.sr.ht/OBJECTS:RW builds.sr.ht/JOBS:RW
 environment:
   NIX_CONFIG: "experimental-features = nix-command flakes"
 sources:
   - https://git.sr.ht/~averagechris/workctl
 tasks:
-  - build: |
+  - release-artifact: |
       cd workctl
       nix build .#release-artifact --out-link result-release-artifact
       mkdir -p ~/artifacts
       cp -p result-release-artifact/* ~/artifacts/
-      mkdir -p dist/downloads
-      cp -p result-release-artifact/* dist/downloads/
-  - publish: |
+  - upload-and-refresh: |
       cd workctl
-      nix run .#build-pages -- --include-existing-downloads
-      nix run .#publish-pages
+      version="$(python3 - <<'PY'
+      import tomllib
+      with open('Cargo.toml', 'rb') as handle:
+          print(tomllib.load(handle)['workspace']['package']['version'])
+      PY
+      )"
+      tag="v${version#v}"
+      commit="$(git rev-parse HEAD)"
+
+      mkdir -p ~/.config/hut
+      token="$(cat ~/.oauth-token)"
+      cat > ~/.config/hut/config <<EOF
+      instance "sr.ht" {
+          access-token "$token"
+      }
+      EOF
+
+      for artifact in result-release-artifact/*.tar.gz; do
+        hut git artifact upload -r workctl --rev "$tag" "$artifact" "$artifact.sha256"
+      done
+
+      manifest="$(mktemp)"
+      cat > "$manifest" <<EOF
+      image: nixos/unstable
+      arch: x86_64
+      oauth: pages.sr.ht/PAGES:RW
+      environment:
+        NIX_CONFIG: "experimental-features = nix-command flakes"
+        TRIGGER_SOURCE: release
+        TRIGGER_PROJECT: workctl
+        TRIGGER_TAG: $tag
+        TRIGGER_SHA: $commit
+      sources:
+        - https://git.sr.ht/~averagechris/averagechris.srht.site
+      tasks:
+        - refresh: |
+            cd averagechris.srht.site
+            nix run .#refresh-pages
+      EOF
+      hut builds submit "$manifest" --note "site refresh: workctl $tag" --visibility unlisted
 artifacts:
   - artifacts/workctl-v0.1.0-x86_64-linux.tar.gz
   - artifacts/workctl-v0.1.0-x86_64-linux.tar.gz.sha256
