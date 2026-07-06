@@ -205,7 +205,7 @@
         program = "${self.packages.${system}.workctl}/bin/workctl";
         meta.description = "Run workctl";
       };
-      inherit ((fleetApps system).apps) prepare-release release-tag release ci-fmt ci-clippy ci-test;
+      inherit ((fleetApps system).apps) prepare-release release-tag release static-checks ci-fmt ci-clippy ci-test;
     });
 
     checks = forAllSystems (system: let
