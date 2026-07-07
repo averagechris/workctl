@@ -27,3 +27,10 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 uuid = { version = "1.19.0", features = ["v4", "serde"] }
 workctl-core = { path = "crates/workctl-core", version = "0.1.1" }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+opt-level = "s"
+panic = "abort"

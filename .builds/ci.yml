@@ -1,0 +1,31 @@
+image: nixos/unstable
+arch: x86_64
+environment:
+  NIX_CONFIG: |
+    experimental-features = nix-command flakes
+    extra-substituters = https://averagechris-dotfiles.cachix.org
+    extra-trusted-public-keys = averagechris-dotfiles.cachix.org-1:VwJkl5dG1+xGDY5x884mH/kVwwpgwBAdBKIF3BZiia4=
+sources:
+  - https://git.sr.ht/~averagechris/workctl
+secrets:
+  - 731f7e55-4497-4228-8fa4-1657da7d3625 # cachix averagechris-dotfiles -> ~/.ci_secrets/cachix_token
+tasks:
+  - static-checks: cd workctl && nix run .#static-checks
+  - test: cd workctl && nix run .#ci-test
+  - package: |
+      cd workctl
+      nix build .#workctl --out-link result-workctl --print-build-logs
+      nix build .#workd --out-link result-workd --print-build-logs
+  - closure-size: |
+      cd workctl
+      nix path-info -S ./result-*
+      nix path-info -rS ./result-* | sort -k2 -n | tail -n 5
+  - cache-warm: |
+      cd workctl
+      if [ ! -f ~/.ci_secrets/cachix_token ]; then
+        echo "no cachix token available; skipping cache warm"
+        exit 0
+      fi
+      CACHIX_AUTH_TOKEN="$(cat ~/.ci_secrets/cachix_token)"
+      export CACHIX_AUTH_TOKEN
+      nix run --inputs-from . nixpkgs#cachix -- push averagechris-dotfiles ./result-*
