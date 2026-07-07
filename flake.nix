@@ -48,15 +48,25 @@
           mainProgram = pname;
         };
       };
-    fleetApps = system:
+    fleetApps = system: let
+      pkgs = pkgsFor system;
+      opensslPkgConfig = pkgs.writeShellApplication {
+        name = "pkg-config";
+        text = ''
+          export PKG_CONFIG_PATH="${pkgs.openssl.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+          exec ${pkgs.pkg-config}/bin/pkg-config "$@"
+        '';
+      };
+    in
       fleet.lib.fleet.presets.rust {
-        pkgs = pkgsFor system;
+        inherit pkgs;
         inherit self;
         pname = "workctl";
         binaries = ["workctl" "workd"];
         versionMode = "workspace";
         lockPackages = ["workctl" "workctl-core" "workd"];
         workspaceDepPins = ["workctl-core"];
+        ciExtraInputs = nixpkgs.lib.optionals pkgs.stdenv.isLinux [opensslPkgConfig];
       };
   in {
     packages =
