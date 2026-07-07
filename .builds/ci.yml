@@ -1,6 +1,9 @@
 image: nixos/unstable
 arch: x86_64
 environment:
+  # local_loop starts workd but health checks can hang indefinitely on sr.ht
+  # builders (job 1814374); keep the suite opt-in for suitable local envs.
+  WORKCTL_SKIP_LOCAL_LOOP: "1"
   NIX_CONFIG: |
     experimental-features = nix-command flakes
     extra-substituters = https://averagechris-dotfiles.cachix.org

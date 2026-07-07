@@ -9,6 +9,10 @@ use std::{
 
 #[test]
 fn cli_submits_task_to_workd_loop_with_fake_harness() {
+    if skip_local_loop() {
+        return;
+    }
+
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("source-repo");
     create_git_repo(&repo);
@@ -216,6 +220,10 @@ fn cli_submits_task_to_workd_loop_with_fake_harness() {
 #[test]
 #[ignore = "requires SSH access to sourcehut plus configured opencode credentials"]
 fn e2e_opencode_summarizes_linear_cli() {
+    if skip_local_loop() {
+        return;
+    }
+
     if std::env::var("WORKCTL_E2E_OPENCODE").ok().as_deref() != Some("1") {
         eprintln!("set WORKCTL_E2E_OPENCODE=1 to run the real opencode/sourcehut E2E");
         return;
@@ -302,6 +310,10 @@ fn e2e_opencode_summarizes_linear_cli() {
 
 #[test]
 fn cli_watch_streams_records_until_terminal_state() {
+    if skip_local_loop() {
+        return;
+    }
+
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("source-repo");
     create_git_repo(&repo);
@@ -420,6 +432,10 @@ fn cli_watch_streams_records_until_terminal_state() {
 
 #[test]
 fn auth_tokens_scope_task_visibility_by_organization() {
+    if skip_local_loop() {
+        return;
+    }
+
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("source-repo");
     create_git_repo(&repo);
@@ -598,6 +614,14 @@ fn wait_for_workd(bind: &str) {
         thread::sleep(Duration::from_millis(100));
     }
     panic!("workd did not become healthy at {bind}");
+}
+
+fn skip_local_loop() -> bool {
+    let skip = std::env::var_os("WORKCTL_SKIP_LOCAL_LOOP").is_some();
+    if skip {
+        eprintln!("skipping local_loop: WORKCTL_SKIP_LOCAL_LOOP set");
+    }
+    skip
 }
 
 fn kill(child: &mut Child) {
