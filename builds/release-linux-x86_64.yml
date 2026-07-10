@@ -12,7 +12,7 @@ environment:
 sources:
   - https://git.sr.ht/~averagechris/workctl
 secrets:
-  - 731f7e55-4497-4228-8fa4-1657da7d3625 # cachix averagechris-dotfiles -> ~/.ci_secrets/cachix_token
+  - 5ec60320-e0d8-4ebe-8b45-1d10cc4d2cb2 # cachix averagechris-dotfiles -> ~/.ci_secrets/cachix_token
 tasks:
   - release-artifact: |
       set -eu
@@ -29,8 +29,10 @@ tasks:
         echo "no cachix token available; skipping cache warm"
         exit 0
       fi
+      set +x
       CACHIX_AUTH_TOKEN="$(cat ~/.ci_secrets/cachix_token)"
       export CACHIX_AUTH_TOKEN
+      set -x
       nix run --inputs-from . nixpkgs#cachix -- push averagechris-dotfiles ./result-release-artifact ./result-*
   - upload-and-refresh: |
       set -eu
@@ -38,7 +40,9 @@ tasks:
       srht() { nix run 'git+https://git.sr.ht/~averagechris/srht' -- "$@"; }
       # Jobs with an oauth grant get ~/.config/hut/config pre-provisioned;
       # srht reads SRHT_TOKEN, so extract that token unless already provided.
+      set +x
       export SRHT_TOKEN="${SRHT_TOKEN:-${OAUTH2_TOKEN:-$(awk '/access-token/ { gsub(/"/, "", $2); print $2; exit }' ~/.config/hut/config 2>/dev/null || true)}}"
+      set -x
       version="$(awk '/^\[workspace\.package\]/{s=1} s && /^version = /{gsub(/"/,"",$3); print $3; exit}' Cargo.toml)"
       tag="v${version#v}"
       commit="$(git rev-parse HEAD)"
