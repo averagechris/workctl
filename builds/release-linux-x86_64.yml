@@ -37,7 +37,7 @@ tasks:
   - upload-and-refresh: |
       set -eu
       cd workctl
-      srht() { nix run 'git+https://git.sr.ht/~averagechris/srht' -- "$@"; }
+      srht() { nix run --inputs-from . fleet#srht -- "$@"; }
       # Jobs with an oauth grant get ~/.config/hut/config pre-provisioned;
       # srht reads SRHT_TOKEN, so extract that token unless already provided.
       set +x

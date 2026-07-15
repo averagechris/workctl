@@ -61,6 +61,7 @@
       fleet.lib.fleet.presets.rust {
         inherit pkgs;
         inherit self;
+        srhtPackage = fleet.packages.${system}.srht;
         pname = "workctl";
         binaries = ["workctl" "workd"];
         versionMode = "workspace";
