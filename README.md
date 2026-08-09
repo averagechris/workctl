@@ -63,17 +63,32 @@ nix develop
 Static pre-push checks are configured for `jj lint`. They intentionally run
 formatters and static analysis for Rust and Nix code, not the full test suite.
 
-Fleet release helpers are exposed through the flake:
+The fail-safe release contract is deliberately two commands:
 
 ```sh
-nix run .#prepare-release -- --version X.Y.Z
-nix build .#release-artifact
-nix run .#build-pages -- --include-existing-downloads
-nix run .#release -- --version X.Y.Z --publish-pages --submit-linux-build
+nix run .#release -- --version X.Y.Z --check
+nix run .#release -- --version X.Y.Z [--submit-linux-build]
 ```
 
-Release builds use `builds/release-linux-x86_64.yml` and publish pages under the
-`/workctl` Sourcehut Pages subdirectory.
+`--check` is non-mutating. A new release starts from a fresh empty jj
+working-copy commit whose parent exactly matches local `main` and
+`main@origin`. Preparation, deterministic validation of the prepared tree, and
+building and checksum-verifying the two-binary (`workctl` and `workd`) artifact
+all finish before the annotated tag and `main` are published atomically with a
+lease on the observed remote ref. There are no release-stage bypass flags.
+
+If post-publication artifact upload or build submission fails, rerunning is
+idempotent only when the requested version, tag and peeled commit, remote and
+local `main`, and checkout all still match exactly. Release builds use
+`builds/release-linux-x86_64.yml` and publish pages under the `/workctl`
+Sourcehut Pages subdirectory.
+
+`jj lint` remains the broad pre-push suite. The release additionally runs the
+evaluated help/documentation contract after the standard fmt, Clippy, and test
+apps. Remote sandboxes cannot exercise every local-loop integration path (and
+may reject build scripts on `noexec` filesystems), so apply-side local
+validation and SourceHut CI are authoritative; CI intentionally sets
+`WORKCTL_SKIP_LOCAL_LOOP` to avoid hanging daemon health checks.
 
 The dev shell also includes dependency-management and supply-chain tooling:
 

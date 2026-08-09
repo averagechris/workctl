@@ -67,7 +67,26 @@
         versionMode = "workspace";
         lockPackages = ["workctl" "workctl-core" "workd"];
         workspaceDepPins = ["workctl-core"];
+        releaseValidationApps = ["release-contract"];
         ciExtraInputs = nixpkgs.lib.optionals pkgs.stdenv.isLinux [opensslPkgConfig];
+      };
+    releaseContract = system: let
+      pkgs = pkgsFor system;
+    in
+      pkgs.writeShellApplication {
+        name = "release-contract";
+        runtimeInputs = [pkgs.gnugrep];
+        text = ''
+          help="$(${(fleetApps system).apps.release.program} --help)"
+          grep -Fq -- 'usage: release --version X.Y.Z [--check] [--allow-downgrade] [--submit-linux-build]' <<<"$help"
+          grep -Fq -- '--check               verify release readiness without editing files or publishing refs' <<<"$help"
+          grep -Fq 'nix run .#release -- --version X.Y.Z --check' README.md
+          grep -Fq 'nix run .#release -- --version X.Y.Z' README.md
+          if grep -Eq -- '--(skip-(validate|tag|artifact|pages)|publish-pages)' <<<"$help" README.md; then
+            printf 'release help or documentation exposes an obsolete release flag\n' >&2
+            exit 1
+          fi
+        '';
       };
   in {
     packages =
@@ -217,6 +236,10 @@
         meta.description = "Run workctl";
       };
       inherit ((fleetApps system).apps) prepare-release release-tag release static-checks ci-fmt ci-clippy ci-test;
+      release-contract = {
+        type = "app";
+        program = "${releaseContract system}/bin/release-contract";
+      };
     });
 
     checks = forAllSystems (system: let
@@ -228,6 +251,8 @@
       '';
     in {
       inherit (self.packages.${system}) workctl workd;
+
+      release-contract = releaseContract system;
 
       nix-format =
         pkgs.runCommand "workctl-nix-format" {
