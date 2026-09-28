@@ -3,7 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    fleet.url = "git+https://git.sr.ht/~averagechris/averagechris.srht.site";
+    fleet.url = "github:averagechris/fleet/e31a02573d79dfeb2496fec6c21cf74a0ece4d79";
   };
 
   outputs = {
@@ -64,6 +64,7 @@
         srhtPackage = fleet.packages.${system}.srht;
         pname = "workctl";
         binaries = ["workctl" "workd"];
+        releaseBackend = "github";
         versionMode = "workspace";
         lockPackages = ["workctl" "workctl-core" "workd"];
         workspaceDepPins = ["workctl-core"];
@@ -78,11 +79,11 @@
         runtimeInputs = [pkgs.gnugrep];
         text = ''
           help="$(${(fleetApps system).apps.release.program} --help)"
-          grep -Fq -- 'usage: release --version X.Y.Z [--check] [--allow-downgrade] [--submit-linux-build]' <<<"$help"
-          grep -Fq -- '--check               verify release readiness without editing files or publishing refs' <<<"$help"
+          grep -Fq -- 'release --version X.Y.Z [--check] [--allow-downgrade]' <<<"$help"
+          grep -Fq -- '--check  nonmutating ref/version preflight only; does not run validation or build artifacts' <<<"$help"
           grep -Fq 'nix run .#release -- --version X.Y.Z --check' README.md
           grep -Fq 'nix run .#release -- --version X.Y.Z' README.md
-          if grep -Eq -- '--(skip-(validate|tag|artifact|pages)|publish-pages)' <<<"$help" README.md; then
+          if grep -Eq -- '--(submit-linux-build|skip-(validate|tag|artifact|pages)|publish-pages)' <<<"$help" README.md AGENTS.md docs/release.md; then
             printf 'release help or documentation exposes an obsolete release flag\n' >&2
             exit 1
           fi

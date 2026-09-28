@@ -67,28 +67,30 @@ The fail-safe release contract is deliberately two commands:
 
 ```sh
 nix run .#release -- --version X.Y.Z --check
-nix run .#release -- --version X.Y.Z [--submit-linux-build]
+nix run .#release -- --version X.Y.Z
 ```
 
 `--check` is non-mutating. A new release starts from a fresh empty jj
 working-copy commit whose parent exactly matches local `main` and
-`main@origin`. Preparation, deterministic validation of the prepared tree, and
-building and checksum-verifying the two-binary (`workctl` and `workd`) artifact
-all finish before the annotated tag and `main` are published atomically with a
-lease on the observed remote ref. There are no release-stage bypass flags.
-
-If post-publication artifact upload or build submission fails, rerunning is
-idempotent only when the requested version, tag and peeled commit, remote and
-local `main`, and checkout all still match exactly. Release builds use
-`builds/release-linux-x86_64.yml` and publish pages under the `/workctl`
-Sourcehut Pages subdirectory.
+`main@origin`. The local GitHub backend validates refs and the prepared tree,
+then atomically publishes the annotated tag and `main` with a lease on the
+observed remote ref. The two-binary (`workctl` and `workd`) artifacts are built
+and checksum-verified by GitHub Actions only after the tag push. An operator
+then verifies the build identities and sidecars, manually
+publishes the four GitHub Release assets, and dispatches the Pages refresh by
+following [`docs/release.md`](docs/release.md). Future releases are GitHub-only;
+historical SourceHut downloads and `builds/release-linux-x86_64.yml` remain
+archival. There are no release-stage bypass flags.
 
 `jj lint` remains the broad pre-push suite. The release additionally runs the
 evaluated help/documentation contract after the standard fmt, Clippy, and test
 apps. Remote sandboxes cannot exercise every local-loop integration path (and
 may reject build scripts on `noexec` filesystems), so apply-side local
-validation and SourceHut CI are authoritative; CI intentionally sets
+validation and CI are authoritative; CI intentionally sets
 `WORKCTL_SKIP_LOCAL_LOOP` to avoid hanging daemon health checks.
+
+The shared release interface comes from the SHA-pinned
+`github:averagechris/fleet` `lib.fleet.presets.rust` preset.
 
 The dev shell also includes dependency-management and supply-chain tooling:
 
